@@ -1,0 +1,1801 @@
+/* IT Schedule + Time Off Tracker — shared front end.
+   Both pages load this file; <body data-page="schedule|timeoff"> picks what runs.
+   All data goes through /api, which checks the Microsoft sign-in session. */
+(function(){
+"use strict";
+const PAGE=document.body.dataset.page;
+const $=id=>document.getElementById(id);
+function on(id,ev,fn){const e=$(id);if(e)e.addEventListener(ev,fn)}
+
+const DAY_KEYS=["mon","tue","wed","thu","fri","sat","sun"];
+const DAY_LABEL={mon:"Mon",tue:"Tue",wed:"Wed",thu:"Thu",fri:"Fri",sat:"Sat",sun:"Sun"};
+const JS_DAY=["sun","mon","tue","wed","thu","fri","sat"];
+const LOCATIONS=["Lester Glenn Mazda of Toms River","Lester Glenn Hyundai of Toms River","Lester Glenn Chevy of Toms River","Lester Glenn GMC of Toms River","Lester Glenn Subaru of Toms River","Lester Glenn Collision of Toms River","Lester Glenn Chrysler of Toms River","Lester Glenn Honda of Sea Girt","Lester Glenn Ford of Ocean","Lester Glenn Chevy of Freehold","Lester Glenn Chevy of Old Bridge","Lester Glenn Corporate of Toms River","Lester Glenn Warranty of Toms River","Lester Glenn Service BDC of Toms River","Lester Glenn Marketing","Lester Glenn Used Car Dept","Remote"];
+const LOC_SHORT={"Lester Glenn Mazda of Toms River":"Mazda","Lester Glenn Hyundai of Toms River":"Hyundai","Lester Glenn Chevy of Toms River":"Chevy TR","Lester Glenn GMC of Toms River":"GMC","Lester Glenn Subaru of Toms River":"Subaru","Lester Glenn Collision of Toms River":"Collision","Lester Glenn Chrysler of Toms River":"Chrysler","Lester Glenn Honda of Sea Girt":"Honda","Lester Glenn Ford of Ocean":"Ford","Lester Glenn Chevy of Freehold":"Chevy Freehold","Lester Glenn Chevy of Old Bridge":"Chevy Old Bridge","Lester Glenn Corporate of Toms River":"Corporate","Lester Glenn Warranty of Toms River":"Warranty","Lester Glenn Service BDC of Toms River":"Service BDC","Lester Glenn Marketing":"Marketing","Lester Glenn Used Car Dept":"Used Car Dept","Remote":"Remote"};
+const locShort=l=>LOC_SHORT[l]||l||"";
+const DEFAULT_SCHED={mon:{start:"08:00",end:"16:30"},tue:{start:"08:00",end:"16:30"},wed:{start:"08:00",end:"16:30"},thu:{start:"08:00",end:"16:30"},fri:{start:"08:00",end:"16:30"},sat:null,sun:null};
+
+const state={me:null,loaded:false,isAdmin:false,links:{schedule:"/",timeoff:"/timeoff/"},
+  employees:[],entries:[],away:[],allowances:new Map(),shifts:[],shiftMap:new Map(),remote:[],
+  year:new Date().getFullYear(),calMonth:null,weekStart:null,selDay:null,locMap:new Map(),projects:[],projMonth:null,editingEmp:null,shiftCtx:null};
+
+/* ---------- dates & times ---------- */
+function pad(n){return String(n).padStart(2,"0")}
+function iso(d){return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())}
+function parse(s){const [y,m,d]=s.split("-").map(Number);return new Date(y,m-1,d)}
+function firstOfMonth(d){return new Date(d.getFullYear(),d.getMonth(),1)}
+function todayIso(){return iso(new Date())}
+function addDays(s,n){const d=parse(s);d.setDate(d.getDate()+n);return iso(d)}
+function mondayOf(s){const d=parse(s);d.setDate(d.getDate()-(d.getDay()+6)%7);return iso(d)}
+function isWeekday(d){const w=d.getDay();return w!==0&&w!==6}
+function bizDays(s,e){if(!s||!e||e<s)return 0;let d=parse(s),end=parse(e),n=0;while(d<=end){if(isWeekday(d))n++;d.setDate(d.getDate()+1)}return n}
+function fmtDate(s){return parse(s).toLocaleDateString(undefined,{month:"short",day:"numeric"})}
+function longDate(s){return parse(s).toLocaleDateString(undefined,{weekday:"long",month:"long",day:"numeric"})}
+function fmtRange(a,b){return a===b?fmtDate(a):fmtDate(a)+" – "+fmtDate(b)}
+function fmtNum(n){return (Math.round(n*10)/10).toString()}
+function toMin(t){const [h,m]=t.split(":").map(Number);return h*60+m}
+function fmtTime(t){const [h,m]=t.split(":").map(Number);const o={hour:"numeric"};if(m)o.minute="2-digit";return new Date(2000,0,1,h,m).toLocaleTimeString(undefined,o)}
+function fmtMin(m){m=((m%1440)+1440)%1440;return fmtTime(pad(Math.floor(m/60))+":"+pad(m%60))}
+function fmtHours(h){return fmtTime(h.start)+" – "+fmtTime(h.end)}
+function span(h){let a=toMin(h.start),b=toMin(h.end);if(b<=a)b+=1440;return [a,b]}
+function durH(h){const [a,b]=span(h);return (b-a)/60}
+state.calMonth=firstOfMonth(new Date());state.weekStart=mondayOf(todayIso());state.selDay=todayIso();state.miniMonth=firstOfMonth(new Date());state.projMonth=firstOfMonth(new Date());
+
+/* ---------- ui helpers ---------- */
+function el(tag,attrs,...kids){const e=document.createElement(tag);if(attrs)for(const k in attrs){const v=attrs[k];if(v==null||v===false)continue;if(k==="class")e.className=v;else if(k==="text")e.textContent=v;else if(k.startsWith("on"))e.addEventListener(k.slice(2),v);else e.setAttribute(k,v===true?"":v)}for(const c of kids){if(c!=null)e.append(c)}return e}
+let toastT;
+function toast(msg){const t=$("toast");t.textContent=msg;t.classList.add("show");clearTimeout(toastT);toastT=setTimeout(()=>t.classList.remove("show"),3200)}
+function notice(msg){const n=$("notice");if(!n)return;if(msg){n.textContent=msg;n.hidden=false}else n.hidden=true}
+function empById(id){return state.employees.find(e=>e.id===id)}
+function firstName(n){return (n||"").trim().split(/\s+/)[0]||n}
+function tc(t){return "t-"+String(t).replace(/[^A-Za-z]/g,"")}
+function sortedEmps(){return [...state.employees].sort((a,b)=>a.name.localeCompare(b.name))}
+
+/* ---------- API ---------- */
+async function api(path,method,body){
+  const r=await fetch("/api/"+path,{method:method||"GET",credentials:"same-origin",
+    headers:body?{"content-type":"application/json"}:{},body:body?JSON.stringify(body):undefined});
+  if(!r.ok){let m="Request failed";try{m=(await r.json()).error||m}catch(_){}
+    if(r.status===401){location.href="/login/?next="+encodeURIComponent(location.pathname);}
+    const e=new Error(m);e.status=r.status;throw e}
+  return r.json();
+}
+async function load(){
+  try{
+    const s=await api("state");
+    state.me=s.me;state.isAdmin=!!(s.me&&s.me.isManager);if(s.links)state.links=s.links;
+    state.employees=s.employees||[];state.away=s.away||[];state.remote=s.remote||[];setShifts(s.shifts||[]);state.locMap=new Map((s.dayLocations||[]).map(x=>[x.employeeId+"|"+x.date,x]));state.projects=s.projects||[];state.inventory=s.inventory||[];state.viewers=s.viewers||[];state.monthReqs=s.monthRequests||[];state.orders=s.orders||[];state.signouts=s.signouts||[];state.slStatus=(s.equipmentStatus||{})["scissor-lift"]||null;
+    state.entries=s.pto||(state.ptoMine?state.ptoMine.pto:[]);state.notify=s.notify||null;state.allowances=new Map(Object.entries(s.allowances||(state.ptoMine?state.ptoMine.allowances:{})||{}).map(([k,v])=>[k,Number(v)]));
+    state.loaded=true;notice("");
+    if(PAGE==="schedule"&&!state.hashDone&&location.hash==="#month-requests"){state.hashDone=true;history.replaceState(null,"",location.pathname);setTimeout(()=>$("mrOpen").click(),0)}
+    if(PAGE==="projects"&&!state.hashDone&&/^#project-/.test(location.hash)){state.hashDone=true;const id=decodeURIComponent(location.hash.slice(9));setTimeout(()=>goToProject(id),0)}
+    if(PAGE==="timeoff"){renderYears();if(state.isAdmin){try{state.users=await api("users")}catch(_){}}}
+  }catch(e){
+    if(e.status!==401)notice("Couldn't load the latest data. It will retry automatically.");
+  }
+  render();
+}
+async function write(fn){
+  try{await fn();await load();return true}
+  catch(e){if(e.status===401)return false;toast(e.message==="Failed to fetch"?"Couldn't reach the server. Check your connection.":e.message||"Couldn't save. Try again.");return false}
+}
+const saveEmployee=b=>write(()=>api("employees","POST",b));
+const deleteEmployee=id=>write(()=>api("employees/"+encodeURIComponent(id),"DELETE"));
+const addEntry=d=>write(()=>api("pto","POST",d));
+const removeEntry=id=>write(()=>api("pto/"+encodeURIComponent(id),"DELETE"));
+const addRemote=d=>write(()=>api("remote","POST",d));
+const removeRemote=id=>write(()=>api("remote/"+encodeURIComponent(id),"DELETE"));
+const setShift=(employeeId,date,d)=>write(()=>api("shifts","PUT",{employeeId,date,...d}));
+const setDayLoc=(employeeId,date,location)=>write(()=>api("locations","PUT",{employeeId,date,location}));
+const clearShift=(employeeId,date)=>write(()=>api("shifts?employeeId="+encodeURIComponent(employeeId)+"&date="+date,"DELETE"));
+function setShifts(list){state.shifts=list;state.shiftMap=new Map(list.map(s=>[s.employeeId+"|"+s.date,s]))}
+
+/* ---------- computations ---------- */
+function schedOf(emp){return emp.schedule||DEFAULT_SCHED}
+function regularFor(emp,date){const s=schedOf(emp)[JS_DAY[parse(date).getDay()]];return s&&s.start&&s.end?s:null}
+function ptoType(id){const e=state.entries.find(x=>x.id===id);return e?e.type:"Time off"}
+function allowanceOf(emp){return state.allowances.has(emp.id)?state.allowances.get(emp.id):0}
+function dayStatus(emp,date){
+  const aw=state.away.find(x=>x.employeeId===emp.id&&x.start<=date&&x.end>=date)||null;
+  const pto=aw?{...aw,type:ptoType(aw.id)}:null;
+  const ov=state.shiftMap.get(emp.id+"|"+date)||null;
+  const hours=ov?(ov.off?null:{start:ov.start,end:ov.end}):regularFor(emp,date);
+  const partial=!!pto&&!!pto.partial,out=!!pto&&!partial;
+  const remote=state.remote.find(x=>x.employeeId===emp.id&&x.start<=date&&x.end>=date)||null;
+  const dayLoc=state.locMap.get(emp.id+"|"+date);
+  const loc=remote?"Remote":(dayLoc?dayLoc.location:(emp.location||""));
+  return {pto,ov,hours,partial,out,remote,loc,locChanged:!!dayLoc,working:!!hours&&!out};
+}
+function workingNow(){
+  const now=new Date(),t=iso(now),m=now.getHours()*60+now.getMinutes(),y=addDays(t,-1),res=[];
+  for(const emp of sortedEmps()){
+    const st=dayStatus(emp,t);
+    if(st.working){const [a,b]=span(st.hours);if(m>=a&&m<b){res.push({emp,until:st.hours.end,remote:!!st.remote,loc:st.loc});continue}}
+    const sy=dayStatus(emp,y);
+    if(sy.working){const [a,b]=span(sy.hours);if(b>1440&&m<b-1440)res.push({emp,until:sy.hours.end,remote:!!sy.remote})}
+  }
+  return res;
+}
+function entriesForYear(y){return state.entries.filter(x=>x.start&&x.start.slice(0,4)===String(y))}
+function outOn(d){return state.entries.filter(x=>x.start<=d&&x.end>=d&&empById(x.employeeId)&&ptoVisible(x.employeeId))}
+function balanceFor(emp){
+  const t=todayIso();let taken=0,sched=0;
+  for(const x of entriesForYear(state.year)){if(x.employeeId!==emp.id)continue;const d=Number(x.days)||0;if(x.end<t)taken+=d;else sched+=d}
+  const allow=Number(allowanceOf(emp))||0;return {allow,taken,sched,remaining:allow-taken-sched};
+}
+
+/* ---------- render ---------- */
+function render(){
+  renderHeader();
+  if(PAGE==="schedule"){renderMr();renderToday();renderMiniCal();renderSchedule();renderTimeline();renderRemote()}
+  else if(PAGE==="projects"){renderProjects();renderSlWhere()}
+  else if(PAGE==="inventory"){renderInventory()}
+  else if(PAGE==="newhires"){/* the New Hire Setup tool runs in its own frame */}
+  else{renderAccess();if(state.ptoViewer){renderBalances();renderCalendar();renderLog();if(state.isAdmin){renderLogins();renderNotify()}}}
+  renderEmpSelects();applyWriteState();renderInvBadge();renderMrButton();if(PAGE!=="orders")renderOrders();
+}
+function renderHeader(){
+  const w=$("whoami");
+  if(w&&state.me){w.replaceChildren(document.createTextNode(`Signed in as ${state.me.name}. `),
+    el("button",{type:"button",class:"linkbtn",text:"Sign out",onclick:signOut}))}
+  /* Time off is open to everyone signed in; the PIN decides what they see */
+}
+/* ---------- Time off PIN gate: everyone unlocks with their PIN; team members see only their own time off ---------- */
+state.ptoViewer=null;let ptoIdle=null;
+const isLead=e=>/manager|cto|director|chief|vp/i.test((e&&e.role)||"");
+function ptoVisible(empId){const v=state.ptoViewer;return !!v&&(v.all||v.id===empId)}
+function ptoLock(msg){state.ptoViewer=null;state.ptoMine=null;clearTimeout(ptoIdle);if(msg)toast(msg);render()}
+function ptoTouch(){clearTimeout(ptoIdle);if(state.ptoViewer)ptoIdle=setTimeout(()=>ptoLock("Time off locked after 10 minutes without activity."),600000)}
+function fillPtoWho(){
+  const s=$("ptoWho");if(!s)return;const cur=s.value;s.replaceChildren(el("option",{value:"",text:"Choose your name…"}));
+  sortedEmps().concat(state.viewers||[]).sort((a,b)=>a.name.localeCompare(b.name)).forEach(e=>s.append(el("option",{value:e.name,text:e.name})));if([...s.options].some(o=>o.value===cur))s.value=cur;
+}
+function renderPtoGate(){
+  const v=state.ptoViewer,g=$("ptoGate");if(!g)return;
+  g.hidden=!state.loadedForGate||!!v;fillPtoWho();
+  const bar=$("ptoViewerBar");if(bar&&v){$("ptoViewerText").textContent=v.all?`Unlocked by ${v.name}: showing everyone’s time off`:`Unlocked by ${v.name}: showing your time off only`}
+  const c=$("ptoContent");if(c)c.classList.toggle("ro",!!v&&!(v.all&&state.isAdmin));
+}
+/* ---------- Request for Time Off (RTO) form ---------- */
+const RTO_MANAGER_EMAILS=["cwolf@lesterglenn.com","kmonica@lesterglenn.com"];
+const rtoVal=n=>{const r=document.querySelector(`input[name="${n}"]:checked`);return r?r.value:""};
+const rtoFmt=d=>d?parse(d).toLocaleDateString("en-US",{month:"numeric",day:"numeric",year:"numeric"}):"";
+function rtoDatesText(){
+  const f=$("rtoFrom").value,t=$("rtoTo").value||f,extra=$("rtoDatesText").value.trim();
+  const range=f?(f===t?rtoFmt(f):`${rtoFmt(f)} – ${rtoFmt(t)}`)+` (${bizDays(f,t)} workday${bizDays(f,t)===1?"":"s"})`:"";
+  return [range,extra].filter(Boolean).join("; ");
+}
+function rtoUpdateDays(){const f=$("rtoFrom").value,t=$("rtoTo").value;if(f&&(!t||t<f))$("rtoTo").value=f;$("rtoDays").textContent=f?`${bizDays(f,$("rtoTo").value)} workday(s)`:""}
+function rtoCheckCalendar(){
+  const f=$("rtoFrom").value,t=$("rtoTo").value||f,me=(state.employees.find(e=>e.name===$("rtoName").value.trim())||{}).id;
+  if(!f){$("rtoCheckNote").textContent="Enter the requested dates first.";return}
+  const others=[...new Set((state.away||[]).filter(x=>x.start<=t&&x.end>=f&&x.employeeId!==me).map(x=>(empById(x.employeeId)||{}).name).filter(Boolean))];
+  document.querySelector(`input[name="rtoConflict"][value="${others.length?"Conflict":"No Conflict"}"]`).checked=true;
+  $("rtoCal").value=todayIso();$("rtoCheckNote").textContent=others.length?`Also out: ${others.join(", ")}`:"No one else is out then.";
+}
+function openRto(){
+  const v=state.ptoViewer,f=$("rtoForm");if(!f)return;f.reset();
+  $("rtoName").value=v?v.name:"";$("rtoSig").value="";$("rtoInit").value=v?v.name.split(/\s+/).map(w=>w[0]).join("").toUpperCase():"";
+  $("rtoDate").value=todayIso();$("rtoDays").textContent="";$("rtoCheckNote").textContent="";$("rtoErr").textContent="";
+  const leads=sortedEmps().filter(isLead).map(e=>e.name).concat((state.viewers||[]).map(x=>x.name));
+  $("rtoMgrList").replaceChildren(...[...new Set(leads)].map(n=>el("option",{value:n})));
+  const lead=!!(v&&v.all);$("rtoMgrPart").disabled=!lead;$("rtoPayroll").hidden=!lead;
+  if(lead){$("rtoRecv").value=todayIso()}
+  $("rtoDlg").showModal();$("rtoDept").focus();
+}
+function rtoData(){
+  return [["Name",$("rtoName").value.trim()],["Date",rtoFmt($("rtoDate").value)],["Department",$("rtoDept").value],["Status",rtoVal("rtoStatus")],
+    ["Manager’s Name",$("rtoMgr").value.trim()],["Requested Date(s) Off",rtoDatesText()],
+    ["Signature of Employee",$("rtoSig").value.trim()?$("rtoSig").value.trim()+" (digitally signed)":""],["Employee Initials",$("rtoInit").value.trim()],
+    ["Requesting time to be deducted from",rtoVal("rtoDeduct")]];
+}
+function rtoMgrData(){
+  return [["Date Received by Mgr",rtoFmt($("rtoRecv").value)],["Calendar Checked",rtoFmt($("rtoCal").value)],["Calendar",rtoVal("rtoConflict")],
+    ["Manager’s Decision",rtoVal("rtoDecision")==="Approved"?"Manager’s Approval":rtoVal("rtoDecision")==="Denied"?"Manager’s Denial":""],["Reason for Denial",$("rtoReason").value.trim()],
+    ["Payroll: absence",rtoVal("rtoPaid")],["If paid, deduct from",rtoVal("rtoPayDeduct")],["Manager’s Signature",$("rtoMgrSig").value.trim()],["Manager’s signature date",rtoFmt($("rtoMgrDate").value)]];
+}
+function rtoCheck(){
+  const miss=[];if(!$("rtoName").value.trim())miss.push("Name");if(!$("rtoDept").value)miss.push("Department");if(!rtoVal("rtoStatus"))miss.push("Status");
+  if(!$("rtoMgr").value.trim())miss.push("Manager’s Name");if(!rtoDatesText())miss.push("Requested Date(s) Off");if(!$("rtoSig").value.trim())miss.push("Signature");
+  if(!rtoVal("rtoDeduct"))miss.push("Personal or Vacation");
+  $("rtoErr").textContent=miss.length?"Please fill in: "+miss.join(", ")+".":"";return !miss.length;
+}
+function rtoText(withMgr){
+  const lines=["REQUEST FOR TIME OFF","",...rtoData().map(([k,v])=>`${k}: ${v||"—"}`)];
+  if(withMgr)lines.push("","MANAGER / PAYROLL USE",...rtoMgrData().map(([k,v])=>`${k}: ${v||"—"}`));
+  return lines.join("\r\n");
+}
+function rtoMail(to,cc,withMgr,intro){
+  const name=$("rtoName").value.trim(),subject=`${name} RTO`;
+  const body=`${intro}\r\n\r\n${rtoText(withMgr)}\r\n\r\nThank you`;
+  const a=document.createElement("a");a.href=`mailto:${to.join(",")}?${cc.length?"cc="+cc.join(",")+"&":""}subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  document.body.append(a);a.click();a.remove();
+}
+function rtoHtml(){
+  const row=([k,v])=>`<tr><th>${escHtml(k)}</th><td>${escHtml(v||"")}</td></tr>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${escHtml($("rtoName").value.trim())} RTO</title>
+<style>body{font-family:Arial,sans-serif;max-width:720px;margin:24px auto;color:#14222e}h1{text-align:center;font-size:22px}img{display:block;margin:0 auto}
+table{width:100%;border-collapse:collapse;margin:10px 0}th{text-align:left;width:42%;padding:7px 8px;font-weight:normal}td{padding:7px 8px;background:#ccd7fb;border-bottom:2px solid #0772bc}
+h2{font-size:15px;text-decoration:underline;margin-top:22px}.note{font-size:12px;font-weight:bold}</style></head><body>
+<img src="${RTO_LOGO}" width="235" alt="Lester Glenn Auto Group"><h1>Request for Time Off</h1><table>${rtoData().map(row).join("")}</table>
+<h2>Manager / Payroll use</h2><table>${rtoMgrData().map(row).join("")}</table>
+<p class="note">*Completed form gets emailed to payroll@lesterglenn.com by the manager with employee’s name and “RTO” in subject line.</p></body></html>`;
+}
+const escHtml=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const RTO_LOGO=(document.querySelector("#rtoDlg .rto-head img")||{}).src||"";
+(function(){
+  const onEl=(id,ev,fn)=>{const e=$(id);if(e)e.addEventListener(ev,fn)};
+  onEl("rtoOpen","click",openRto);onEl("rtoFrom","change",rtoUpdateDays);onEl("rtoTo","change",rtoUpdateDays);onEl("rtoCheck","click",rtoCheckCalendar);
+  onEl("rtoSig","input",()=>{const n=$("rtoSig").value.trim();if(n)$("rtoInit").value=n.split(/\s+/).map(w=>w[0]||"").join("").toUpperCase().slice(0,4)});
+  onEl("rtoEmail","click",()=>{if(!rtoCheck())return;
+    const mgr=$("rtoMgr").value.trim(),lead=sortedEmps().find(e=>e.name===mgr);
+    rtoMail(RTO_MANAGER_EMAILS,[],!!(state.ptoViewer&&state.ptoViewer.all),`Hello${mgr?" "+mgr.split(/\s+/)[0]:""},\r\n\r\nPlease review my request for time off below.`);
+    toast("Your email is ready to send. Download a copy too if you want to attach the form.")});
+  onEl("rtoPayroll","click",()=>{if(!rtoCheck())return;if(!rtoVal("rtoDecision")){$("rtoErr").textContent="Choose Manager’s Approval or Denial first.";return}
+    rtoMail(["payroll@lesterglenn.com"],[],true,"Hello,\r\n\r\nPlease see the completed Request for Time Off below.");});
+  onEl("rtoDownload","click",async()=>{if(!$("rtoName").value.trim()){$("rtoErr").textContent="Enter the name first.";return}
+    await saveCsv(`${$("rtoName").value.trim().replace(/[^\w\- ]+/g,"")} RTO.html`,rtoHtml())});
+})();
+/* ---------- New Month Schedule: weekend-off and day-off requests for next month ---------- */
+state.mrMgr=null;
+function mrMonth(){const d=new Date();const m=new Date(d.getFullYear(),d.getMonth()+1,1);return {key:`${m.getFullYear()}-${pad(m.getMonth()+1)}`,date:m,label:m.toLocaleDateString(undefined,{month:"long",year:"numeric"})}}
+function mrReqs(){const k=mrMonth().key;return (state.monthReqs||[]).filter(r=>r.month===k)}
+function mrNewCount(){return (state.monthReqs||[]).filter(r=>r.status==="new").length}
+{const ta=$("topAlert");if(ta)ta.addEventListener("click",()=>{if(PAGE==="schedule")$("mrOpen").click();else location.href="/#month-requests"})}
+function renderMrButton(){
+  const n=mrNewCount(),m=mrMonth(),ta=$("topAlert");
+  if(ta){ta.hidden=!n;$("topAlertText").textContent=`${n} new schedule request${n===1?"":"s"}`;ta.title=n?`New Month Schedule: ${n} new request${n===1?"":"s"} for Chris Wolf to review. Select to open.`:""}
+  const b=$("mrOpen");if(!b)return;
+  $("mrLabel").textContent=`📅 New Month Schedule: ${m.label}`;
+  b.classList.toggle("mr-alert",n>0);$("mrBadge").textContent=n?String(n):"";
+  b.title=n?`${n} new request${n===1?"":"s"} for Chris Wolf to review`:`Request weekends and days off for ${m.label}`;
+}
+function mrWhat(r){return r.kind==="weekend"?`Weekend off (${fmtDate(r.date)}–${fmtDate(addDays(r.date,1))})`:`Day off ${parse(r.date).toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"})}`+(r.covering?` · ${r.covering==="yes"?"Covering":"Not covering"} Sat ${fmtDate(r.saturday||addDays(mondayOf(r.date),5))}`:"")}
+// Ask whether they are covering the Saturday of that week. Resolves "yes", "no", or null if they cancel.
+function mrAskSaturday(d){
+  return new Promise(res=>{
+    const dlg=$("mrSatDlg"),sat=addDays(mondayOf(d),5);
+    $("mrSatQ").textContent=`Are you covering Saturday, ${parse(sat).toLocaleDateString(undefined,{month:"long",day:"numeric"})}?`;
+    $("mrSatInfo").textContent=`You’re asking for ${parse(d).toLocaleDateString(undefined,{weekday:"long",month:"long",day:"numeric"})} off. Let Chris know if you’re also working the Saturday that week.`;
+    dlg.returnValue="";
+    const done=()=>{dlg.removeEventListener("close",done);res(dlg.returnValue==="yes"||dlg.returnValue==="no"?dlg.returnValue:null)};
+    dlg.addEventListener("close",done);dlg.showModal();
+  });
+}
+function renderMr(){
+  renderMrButton();const cal=$("mrCal");if(!cal||!$("mrDlg").open)return;
+  const m=mrMonth(),reqs=mrReqs(),who=$("mrWho").value,me=state.employees.find(e=>e.name===who);
+  $("mrTitle").textContent=`${m.label} Schedule Requests`;
+  cal.replaceChildren(...["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].map(d=>el("div",{class:"dow",text:d})));
+  const first=iso(m.date),last=iso(new Date(m.date.getFullYear(),m.date.getMonth()+1,0));
+  for(let d=mondayOf(first);d<=last||parse(d).getDay()!==1;d=addDays(d,1)){
+    if(d>last&&parse(d).getDay()===1)break;
+    const inM=d>=first&&d<=last,dt=parse(d),we=!isWeekday(dt),sat=dt.getDay()===6?d:dt.getDay()===0?addDays(d,-1):null;
+    const here=reqs.filter(r=>r.kind==="weekend"?(sat&&r.date===sat):r.date===d);
+    const cov=dt.getDay()===6?reqs.filter(r=>r.kind==="day"&&r.covering==="yes"&&r.status!=="denied"&&(r.saturday||addDays(mondayOf(r.date),5))===d):[];
+    const cell=el("button",{type:"button",class:"mr-day"+(we?" we":"")+(inM?"":" out"),disabled:!inM,
+      "aria-label":`${longDate(d)}${we?", weekend":""}. ${here.length?here.map(r=>r.name+" "+r.kind).join(", "):"No requests"}.`},
+      el("span",{class:"n",text:String(dt.getDate())}),
+      ...here.map(r=>el("span",{class:`mr-chip ${r.kind==="weekend"?"we":"day"} ${r.status}`+(me&&r.employeeId===me.id?" mine":""),title:`${r.name}: ${mrWhat(r)} (${r.status==="new"?"waiting for review":r.status})`,text:firstName(r.name)})),...cov.map(r=>el("span",{class:"mr-chip cov",title:`${r.name} is covering this Saturday`,text:"✓ "+firstName(r.name)})));
+    if(inM)cell.addEventListener("click",()=>mrToggle(d));
+    cal.append(cell);
+  }
+  // list
+  const box=$("mrList");box.replaceChildren();const mgr=state.mrMgr;
+  $("mrMgrLock").hidden=!!mgr;$("mrMgrOn").hidden=!mgr;if(mgr)$("mrMgrText").textContent=`Reviewing as ${mgr}`;
+  if(!reqs.length){box.append(el("p",{class:"emp-role",text:"No requests yet for "+m.label+"."}));return}
+  const tbl=el("table"),tb=el("tbody");
+  tbl.append(el("thead",null,el("tr",null,el("th",{text:"Name"}),el("th",{text:"Request"}),el("th",{text:"Requested"}),el("th",{text:"Status"}),el("th",null))));
+  [...reqs].sort((a,b)=>a.date.localeCompare(b.date)||a.name.localeCompare(b.name)).forEach(r=>tb.append(el("tr",null,
+    el("td",{class:"emp-name",text:r.name}),el("td",{text:mrWhat(r)}),el("td",{style:"white-space:nowrap",text:fmtStamp(r.createdAt)}),
+    el("td",null,el("span",{class:r.status==="new"?"mr-new":r.status==="approved"?"qty-in":"note",text:r.status==="new"?"● New":r.status==="seen"?"Reviewed":r.status[0].toUpperCase()+r.status.slice(1)}),r.reviewedBy?el("div",{class:"note",text:"by "+r.reviewedBy}):null),
+    el("td",{class:"num",style:"white-space:nowrap"},mgr&&r.status!=="approved"?el("button",{class:"btn small",type:"button",text:"✓ Approve",onclick:()=>mrDecide(r,"approved")}):null,
+      mgr&&r.status!=="denied"?el("button",{class:"btn small ghost danger",type:"button",text:"Deny",onclick:()=>mrDecide(r,"denied")}):null))));
+  tbl.append(tb);box.append(tbl);
+}
+async function mrToggle(d){
+  const who=$("mrWho").value,er=$("mrErr");er.textContent="";
+  if(!who){er.textContent="Choose your name first.";$("mrWho").focus();return}
+  const emp=state.employees.find(e=>e.name===who),dt=parse(d),we=!isWeekday(dt),reqs=mrReqs().filter(r=>r.employeeId===emp.id);
+  if(we){
+    const sat=dt.getDay()===6?d:addDays(d,-1),ex=reqs.find(r=>r.kind==="weekend"&&r.date===sat);
+    if(ex){if(ex.status!=="new"){er.textContent="That request was already reviewed. Ask Chris Wolf to change it.";return}
+      if(confirm(`Take back your request for the weekend of ${fmtDate(sat)}?`)&&await mrDelete(ex.id))toast("Weekend request removed");return}
+    if(await mrAdd({month:mrMonth().key,employeeId:emp.id,name:emp.name,kind:"weekend",date:sat}))toast(`Requested the weekend of ${fmtDate(sat)} off`);
+    return;
+  }
+  const wk=mondayOf(d),ex=reqs.find(r=>r.kind==="day"&&mondayOf(r.date)===wk);
+  if(ex&&ex.date===d){if(ex.status!=="new"){er.textContent="That request was already reviewed. Ask Chris Wolf to change it.";return}
+    if(confirm(`Take back your request for ${longDate(d)}?`)&&await mrDelete(ex.id))toast("Day off request removed");return}
+  if(ex){if(ex.status!=="new"){er.textContent=`You already have ${mrWhat(ex).toLowerCase()} that week.`;return}
+    if(!confirm(`You already asked for ${parse(ex.date).toLocaleDateString(undefined,{weekday:"long"})} off that week. Switch it to ${dt.toLocaleDateString(undefined,{weekday:"long"})}?`))return;
+  }
+  const covering=await mrAskSaturday(d);if(!covering)return;
+  if(ex)await mrDelete(ex.id);
+  const saturday=addDays(mondayOf(d),5);
+  if(await mrAdd({month:mrMonth().key,employeeId:emp.id,name:emp.name,kind:"day",date:d,covering,saturday}))
+    toast(`Requested ${longDate(d)} off. ${covering==="yes"?"Covering":"Not covering"} Saturday ${fmtDate(saturday)}.`);
+}
+async function mrDecide(r,status){
+  if(!(await mrUpdate(r,status)))return;
+  if(status==="approved"){ // put it on the weekly schedule as a day off
+    const days=r.kind==="weekend"?[r.date,addDays(r.date,1)]:[r.date];
+    for(const d of days)await setShift(r.employeeId,d,{off:true,start:null,end:null,note:"Approved day off request"});
+  }
+  toast(`${r.name}: ${mrWhat(r).toLowerCase()} ${status}.`);
+}
+(function(){
+  const onEl=(id,ev,fn)=>{const e=$(id);if(e)e.addEventListener(ev,fn)};
+  onEl("mrOpen","click",()=>{
+    const w=$("mrWho");w.replaceChildren(el("option",{value:"",text:"Choose your name…"}));sortedEmps().forEach(e=>w.append(el("option",{value:e.name,text:e.name})));
+    const mw=$("mrMgrWho");mw.replaceChildren(...sortedEmps().filter(isLead).map(e=>e.name).concat((state.viewers||[]).map(v=>v.name)).map(n=>el("option",{value:n,text:n})));
+    if([...mw.options].some(o=>o.value==="Chris Wolf"))mw.value="Chris Wolf";
+    $("mrErr").textContent="";$("mrDlg").showModal();renderMr();w.focus();
+  });
+  onEl("mrWho","change",renderMr);
+  onEl("mrMgrBtn","click",async()=>{const n=$("mrMgrWho").value,pe=await mrCheckManager(n,$("mrMgrPin").value.trim());$("mrMgrPin").value="";
+    if(pe){$("mrErr").textContent=pe;return}$("mrErr").textContent="";state.mrMgr=n;renderMr()});
+  onEl("mrMgrOff","click",()=>{state.mrMgr=null;renderMr()});
+  onEl("mrAllSeen","click",async()=>{for(const r of (state.monthReqs||[]).filter(x=>x.status==="new"))await mrUpdate(r,"seen");toast("All new requests marked reviewed.")});
+  onEl("mrDlg","close",()=>{state.mrMgr=null;state.mrMgrPin=null});
+})();
+async function mrAdd(data){return write(()=>api("month-requests","POST",data))}
+async function mrDelete(id){return write(()=>api("month-requests/"+encodeURIComponent(id),"DELETE"))}
+async function mrUpdate(r,status){return write(()=>api("month-requests/"+encodeURIComponent(r.id),"PUT",{status,manager:state.mrMgr,pin:state.mrMgrPin}))}
+async function mrCheckManager(name,pin){const pe=await checkPin(name,pin);if(pe)return pe;
+  try{await api("month-requests/verify","POST",{manager:name,pin});state.mrMgrPin=pin;return null}catch(e){return e.message}}
+function renderAccess(){
+  state.loadedForGate=state.loaded;const v=state.ptoViewer,show=state.loaded&&!!v,full=show&&v.all&&state.isAdmin;
+  $("ptoContent").hidden=!show;$("lockPanel").hidden=state.loaded;
+  if(!state.loaded){$("lockTitle").textContent="Checking your access…";$("lockMsg").textContent=""}
+  $("logBtn").hidden=$("addEmpBtn").hidden=!full;$("yearSel").hidden=!show;
+  renderPtoGate();
+}
+on("ptoGateForm","submit",async ev=>{
+  ev.preventDefault();const name=$("ptoWho").value,pin=$("ptoPin").value.trim(),er=$("ptoGateErr");er.textContent="";
+  if(!name){er.textContent="Choose your name.";$("ptoWho").focus();return}
+  const pe=await checkPin(name,pin);if(pe){er.textContent=pe;$("ptoPin").value="";$("ptoPin").focus();return}
+  try{
+    const r=await api("timeoff/unlock","POST",{name,pin});state.ptoViewer=r.viewer;
+    if(!(r.viewer.all&&state.isAdmin)){state.ptoMine={pto:r.pto||[],allowances:r.allowances||{}};state.entries=state.ptoMine.pto;
+      state.allowances=new Map(Object.entries(state.ptoMine.allowances).map(([k,x])=>[k,Number(x)]))}
+    $("ptoPin").value="";ptoTouch();renderYears();render();
+  }catch(err){er.textContent=err.message;$("ptoPin").value="";$("ptoPin").focus()}
+});
+on("ptoLockBtn","click",()=>ptoLock());
+{const pp=$("lockPanel");if(pp&&PAGE==="timeoff"){document.addEventListener("click",ptoTouch);document.addEventListener("keydown",ptoTouch)}}
+
+function renderToday(){
+  const t=todayIso();
+  $("todayDate").textContent=longDate(t);
+  const inG=$("inGrp"),outG=$("outGrp");
+  inG.replaceChildren(el("b",{text:"On shift"}));outG.replaceChildren(el("b",{text:"Out"}));
+  if(!state.loaded){$("todayHeadline").textContent="Loading…";return}
+  if(!state.employees.length){$("todayHeadline").textContent="Add your team to start building the schedule.";inG.hidden=outG.hidden=true;$("aheadCount").textContent="0";return}
+  const now=workingNow(),nowM=new Date().getHours()*60+new Date().getMinutes();
+  const out=state.away.filter(x=>x.start<=t&&x.end>=t&&!x.partial&&empById(x.employeeId)).map(x=>({...x,type:ptoType(x.id)}));
+  const later=sortedEmps().filter(e=>{const st=dayStatus(e,t);return st.working&&toMin(st.hours.start)>nowM});
+  let h=now.length?`${now.length} ${now.length===1?"person is":"people are"} on shift now.`:"No one is on shift right now.";
+  if(!now.length&&later.length)h+=` Next in: ${firstName(later[0].name)} at ${fmtTime(dayStatus(later[0],t).hours.start)}.`;
+  $("todayHeadline").textContent=h;
+  now.forEach(x=>inG.append(el("span",{text:`${x.emp.name}${x.loc?` (${locShort(x.loc)})`:(x.remote?" (remote)":"")} until ${fmtTime(x.until)}`})));
+  out.forEach(x=>{const e=empById(x.employeeId);outG.append(el("span",{text:`${e.name}${x.type!=="Time off"?", "+x.type:""}${x.end>t?" until "+fmtDate(x.end):""}`}))});
+  inG.hidden=!now.length;outG.hidden=!out.length;
+  const end=addDays(t,14);
+  $("aheadCount").textContent=new Set(state.away.filter(x=>x.start<=end&&x.end>=t&&empById(x.employeeId)).map(x=>x.employeeId)).size;
+}
+
+/* ---------- on-screen calendar (schedule page) ---------- */
+function goToDay(d){
+  state.selDay=d;state.weekStart=mondayOf(d);
+  const m=firstOfMonth(parse(d));if(m.getTime()!==state.miniMonth.getTime())state.miniMonth=m;
+  renderMiniCal();renderSchedule();renderTimeline();
+}
+function personColors(){
+  const pal=["#0772bc","#0f766e","#7c3aed","#b45309","#be185d","#4d7c0f","#1d4ed8","#a21caf","#0e7490","#9a3412"];
+  const m=new Map();sortedEmps().forEach((e,i)=>m.set(e.id,pal[i%pal.length]));return m;
+}
+function initials(n){const p=String(n||"").trim().split(/\s+/);return ((p[0]||"")[0]||"").toUpperCase()+((p.length>1?p[p.length-1][0]:(p[0]||"")[1])||"").toUpperCase()}
+function shortTime(t){const [h,m]=t.split(":").map(Number);const h12=h%12||12;return h12+(m?":"+String(m).padStart(2,"0"):"")+(h<12?"a":"p")}
+function renderMiniCal(){
+  const box=$("miniCal");if(!box)return;box.replaceChildren();
+  const m=state.miniMonth,t=todayIso(),colors=personColors(),only=state.calPerson&&empById(state.calPerson)?state.calPerson:null;
+  $("mcLabel").textContent=m.toLocaleDateString(undefined,{month:"long",year:"numeric"});
+  const tbl=el("table",{role:"grid","aria-labelledby":"mcLabel"}),head=el("tr");
+  ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].forEach(n=>head.append(el("th",{scope:"col",text:n,title:n})));
+  tbl.append(el("thead",null,head));
+  const tb=el("tbody");let d=mondayOf(iso(m));const last=iso(new Date(m.getFullYear(),m.getMonth()+1,0));
+  while(d<=last){
+    const tr=el("tr",{class:d===state.weekStart?"sel-week":null});
+    for(let i=0;i<7;i++){
+      const dt=parse(d),wk=isWeekday(dt),inMonth=dt.getMonth()===m.getMonth(),day=d;
+      const people=sortedEmps().filter(e=>!only||e.id===only).map(e=>({e,st:dayStatus(e,d)}));
+      const chips=el("span",{class:"mc-people"}),said={work:[],remote:[],out:[]};
+      for(const {e,st} of people){
+        const c=colors.get(e.id);
+        if(st.out&&(st.hours||wk)){said.out.push(e.name);chips.append(el("span",{class:"pc out",title:`${e.name}: out`,style:`--pc:${c}`,text:only?"Out":(state.calFull?`${firstName(e.name)} out`:initials(e.name))}))}
+        else if(st.working){
+          (st.remote?said.remote:said.work).push(e.name);
+          const hrs=shortTime(st.hours.start)+"–"+shortTime(st.hours.end);
+        const lc=st.loc?" "+locShort(st.loc):"";
+        const txt=only?hrs+lc:(state.calFull?`${firstName(e.name)} ${hrs}${lc}`:initials(e.name));
+          chips.append(el("span",{class:"pc"+(st.remote?" remote":""),title:`${e.name}: ${fmtHours(st.hours)}${st.loc?", "+st.loc:""}`,style:`--pc:${c}`,text:txt}));
+        }
+      }
+      const parts=[said.work.length?"working: "+said.work.join(", "):"",said.remote.length?"remote: "+said.remote.join(", "):"",said.out.length?"out: "+said.out.join(", "):""].filter(Boolean).join("; ");
+      const cls="mc-day"+(wk?"":" wknd")+(inMonth?"":" other")+(d===t?" today":"")+(d===state.selDay?" sel":"")+(only?" one":"");
+      tr.append(el("td",null,el("button",{class:cls,type:"button","aria-pressed":String(d===state.selDay),
+        "aria-label":longDate(d)+(d===t?", today":"")+(parts?`. ${parts}`:". No one scheduled"),onclick:()=>goToDay(day)},
+        el("span",{class:"mc-num",text:String(dt.getDate())}),chips)));
+      d=addDays(d,1);
+    }
+    tb.append(tr);
+  }
+  tbl.append(tb);box.append(tbl);
+  // People key, which also filters the calendar to one person
+  const key=$("mcPeople");if(!key)return;key.replaceChildren();
+  const btn=(id,label,color)=>el("button",{type:"button",class:"mc-key"+((only||"")===id?" on":""),"aria-pressed":String((only||"")===id),
+    onclick:()=>{state.calPerson=id||null;renderMiniCal()}},color?el("span",{class:"pc",style:`--pc:${color}`,text:initials(label)}):null,document.createTextNode(label));
+  key.append(btn("","Everyone",null));
+  sortedEmps().forEach(e=>key.append(btn(e.id,e.name,colors.get(e.id))));
+}
+on("mcPrev","click",()=>{const m=state.miniMonth;state.miniMonth=new Date(m.getFullYear(),m.getMonth()-1,1);renderMiniCal()});
+on("mcNext","click",()=>{const m=state.miniMonth;state.miniMonth=new Date(m.getFullYear(),m.getMonth()+1,1);renderMiniCal()});
+function setCalFull(on){
+  const p=$("calPanel"),b=$("mcFull");if(!p)return;
+  state.calFull=on;p.classList.toggle("cal-full",on);document.body.classList.toggle("cal-open",on);
+  b.textContent=on?"⤡ Exit full screen":"⤢ Full screen";b.setAttribute("aria-pressed",String(on));
+  try{
+    if(on&&p.requestFullscreen&&!document.fullscreenElement)p.requestFullscreen().catch(()=>{});
+    if(!on&&document.fullscreenElement)document.exitFullscreen().catch(()=>{});
+  }catch(_){}
+  renderMiniCal();b.focus();
+}
+on("mcFull","click",()=>setCalFull(!state.calFull));
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&state.calFull&&!document.querySelector("dialog[open]"))setCalFull(false)});
+document.addEventListener("fullscreenchange",()=>{if(!document.fullscreenElement&&state.calFull)setCalFull(false)});
+
+/* ---------- projects calendar ---------- */
+// Blue is reserved for completed projects, so it isn't in this list.
+const PROJ_COLORS=["#0f766e","#7c3aed","#b45309","#be185d","#4d7c0f","#a21caf","#9a3412","#475569","#b91c1c","#15803d"];
+const PROJ_FILTERS={all:{label:"All projects",test:()=>true},ongoing:{label:"Ongoing",test:p=>p.status==="In progress"},completed:{label:"Completed",test:p=>p.status==="Done"}};
+const projMatches=p=>(PROJ_FILTERS[state.projFilter||"all"]||PROJ_FILTERS.all).test(p);
+function projColor(p){let h=0;for(const c of String(p.id||p.name))h=(h*31+c.charCodeAt(0))>>>0;return PROJ_COLORS[h%PROJ_COLORS.length]}
+const statusLabel=s=>s==="In progress"?"Ongoing":s==="Done"?"Completed":(s||"Planned");
+function fmtStamp(isoStr){if(!isoStr)return"";const d=new Date(isoStr);return d.toLocaleDateString(undefined,{month:"short",day:"numeric"})+", "+d.toLocaleTimeString(undefined,{hour:"numeric",minute:"2-digit"})}
+function lastUpdate(p){const u=p.updates||[];return u.length?u[u.length-1]:null}
+function renderProjStats(){
+  const box=$("projStats");if(!box)return;box.replaceChildren();
+  const all=state.projects||[];
+  for(const [key,f] of Object.entries(PROJ_FILTERS)){
+    const n=all.filter(f.test).length,on=(state.projFilter||"all")===key;
+    box.append(el("button",{type:"button",class:"pstat pstat-"+key+(on?" on":""),"aria-pressed":String(on),
+      "aria-label":`${f.label}: ${n}. ${on?"Showing":"Show"} ${f.label.toLowerCase()}.`,
+      onclick:()=>{state.projFilter=key;renderProjects();applyWriteState()}},
+      el("strong",{text:String(n)}),el("span",{text:f.label})));
+  }
+}
+/* Where is the scissor lift right now (one shared value) */
+function slInfo(){const s=state.slStatus||{};return {location:s.location||"",updatedAt:s.updatedAt||null,updatedBy:s.updatedBy||""}}
+function renderSlWhere(){
+  const s=slInfo(),when=s.updatedAt?`Updated ${fmtStamp(s.updatedAt)}${s.updatedBy?" by "+s.updatedBy:""}`:"";
+  ["slWhere","slWhere2"].forEach(id=>{const e=$(id);if(e&&document.activeElement!==e)e.value=s.location});
+  ["slWhen","slWhen2"].forEach(id=>{const e=$(id);if(e)e.textContent=when});
+}
+async function changeSlWhere(location){
+  const data={location,updatedAt:new Date().toISOString(),updatedBy:state.meName||(state.me&&state.me.name)||""};
+  if(await saveSlStatus(data)){state.slStatus=data;renderSlWhere();updateSlBox();toast(location?`Scissor lift is now at ${location}`:"Scissor lift location cleared")}
+  else renderSlWhere();
+}
+["slWhere","slWhere2"].forEach(id=>{const e=$(id);if(e)e.addEventListener("change",()=>changeSlWhere(e.value))});
+async function saveSlStatus(data){return write(()=>api("equipment/scissor-lift","PUT",{location:data.location}))}
+/* Scissor lift transport email (opens in the default mail app, e.g. Outlook classic) */
+const SL_TO="whope@lesterglenn.com",SL_CC=["it@lesterglenn.com","pleone@lesterglenn.com","kmonica@lesterglenn.com"];
+function slSubject(from,to){
+  const nm=l=>l==="Lester Glenn Chevy of Toms River"?"Chevy Toms River":l==="Other location"?"another location":locShort(l);
+  if(!from||from==="Other location"&&to!=="Other location")return from?`Lester Glenn IT Lift at another location needs to go to ${nm(to)}`:`Lester Glenn IT Lift needs to go to ${nm(to)}`;
+  if(from===to)return `Lester Glenn IT Lift needed at ${nm(to)}`;
+  return `Lester Glenn IT Lift at ${nm(from)} needs to go to ${nm(to)}`;
+}
+function updateSlBox(){
+  const box=$("slBox");if(!box)return;
+  const on=!!$("pEquip").querySelector('input[value="Scissor Lift"]:checked');box.hidden=!on;if(!on)return;
+  const loc=$("pLoc").value,start=$("pStart").value,a=$("slMail"),pv=$("slPreview");
+  if(!loc||!start){a.setAttribute("aria-disabled","true");a.removeAttribute("href");
+    pv.textContent=!loc?"Choose the project’s Location above first, so the email says where to send it.":"Choose the project’s Start date first.";return}
+  const when=parse(start).toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"});
+  const me=state.meName||(state.me&&state.me.name)||"";
+  const cur=slInfo().location;
+  const line=!cur?`Can you have the scissor lift moved to ${loc}?`
+    :cur===loc?`Can you make sure the scissor lift is at ${loc}?`
+    :`Can you have the scissor lift moved from ${cur} to ${loc}?`;
+  const body=`Hello Bill Hope,\r\n\r\n${line} We need the lift there the morning of ${when}.\r\n\r\nThank you${me?",\r\n"+me:""}`;
+  a.href=`mailto:${SL_TO}?cc=${SL_CC.join(",")}&subject=${encodeURIComponent(slSubject(cur,loc))}&body=${encodeURIComponent(body)}`;
+  a.removeAttribute("aria-disabled");
+  pv.textContent=`Subject: “${slSubject(cur,loc)}”. To Bill Hope, CC IT, P. Leone and K. Monica, for ${when}.`;
+}
+["pEquip","pLoc","pStart"].forEach(id=>{const e=$(id);if(e)e.addEventListener("change",updateSlBox)});
+/* ---------- inventory needed for a project ---------- */
+function invById(id){return (state.inventory||[]).find(x=>x.id===id)||null}
+function projInvRow(x){
+  const sel=el("select",{class:"pi-item","aria-label":"Inventory item"});
+  sel.append(el("option",{value:"",text:"Choose an item…"}));
+  [...(state.inventory||[])].sort((a,b)=>a.name.localeCompare(b.name)).forEach(it=>sel.append(el("option",{value:it.id,text:`${it.name} (${it.qty} on hand)`})));
+  if(x&&x.itemId&&!invById(x.itemId))sel.append(el("option",{value:x.itemId,text:`${x.name||"Removed item"} (no longer in inventory)`}));
+  sel.value=x&&x.itemId||"";
+  const qty=el("input",{type:"number",class:"pi-qty",min:"1",max:"99999",step:"1","aria-label":"Quantity needed"});qty.value=x&&x.qty||1;
+  const av=el("span",{class:"pi-avail"});
+  const upd=()=>{const it=invById(sel.value),n=Math.max(1,Math.round(Number(qty.value)||1));
+    if(!it||(x&&x.used&&sel.value===x.itemId)){av.textContent=it&&x&&x.used?"Taken from stock":"";av.className="pi-avail";return}
+    const cur=state.projCtx&&(state.projCtx.inventoryItems||[]).find(y=>y.itemId===sel.value&&!y.used),pr=cur?Number(cur.reserved||0):0,avail=Number(it.qty)+pr;
+    const short=n>avail;av.textContent=short?`⚠ Only ${avail} available`:(pr?`✓ ${pr} reserved · ${it.qty} more in stock`:`✓ ${it.qty} in stock`);av.className="pi-avail "+(short?"short":"ok")};
+  sel.addEventListener("change",upd);qty.addEventListener("input",upd);
+  const row=el("div",{class:"pi-row"+(x&&x.used?" used":"")},sel,qty,av,
+    el("button",{type:"button",class:"sup-x","aria-label":"Remove item",title:"Remove item",text:"×",onclick:()=>{row.remove();if(!$("pInvItems").children.length)$("pInvItems").append(projInvRow())}}));
+  row.dataset.used=x&&x.used?"1":"";upd();
+  return row;
+}
+function renderProjInv(list){
+  const box=$("pInvItems");box.replaceChildren();
+  if(!(state.inventory||[]).length&&!(list&&list.length)){box.append(el("p",{class:"emp-role",style:"margin:0 0 6px",text:"No items in Inventory yet. Add them on the Inventory tab, then link them here."}));$("pInvAdd").hidden=true;return}
+  $("pInvAdd").hidden=false;(list&&list.length?list:[null]).forEach(x=>box.append(projInvRow(x)));
+}
+function readProjInv(){
+  const m=new Map();
+  $("pInvItems").querySelectorAll(".pi-row").forEach(r=>{const id=r.querySelector(".pi-item").value;if(!id)return;
+    const n=Math.max(1,Math.round(Number(r.querySelector(".pi-qty").value)||1)),it=invById(id),prev=m.get(id);
+    m.set(id,{itemId:id,name:it?it.name:(prev&&prev.name)||"",qty:(prev?prev.qty:0)+n,used:(prev&&prev.used)||r.dataset.used==="1"})});
+  return [...m.values()];
+}
+function projInvLine(p){
+  const l=p.inventoryItems||[];if(!l.length)return null;let anyShort=false;
+  const parts=l.map(x=>{const it=invById(x.itemId),nm=it?it.name:(x.name||"Removed item"),r=Number(x.reserved||0),short=!x.used&&r<Number(x.qty);
+    if(short)anyShort=true;return `${x.qty} × ${nm}${x.used?"":short?` (⚠ only ${r} reserved, ${Number(x.qty)-r} more needed)`:" (reserved)"}`});
+  return el("div",{class:"pinv"+(anyShort?" short":"")},el("b",{text:l.every(x=>x.used)?"Inventory used: ":anyShort?"⚠ Inventory reserved: ":"Inventory reserved: "}),document.createTextNode(parts.join(", ")));
+}
+// Inventory set aside for projects: shown on the Inventory screen with a link to the project.
+function reservationsFor(itemId){const out=[];(state.projects||[]).forEach(p=>(p.inventoryItems||[]).forEach(x=>{if(x.itemId===itemId&&!x.used&&Number(x.qty))out.push({p,qty:Number(x.qty),reserved:Number(x.reserved||0)})}));return out}
+function reservationNotes(itemId){
+  const rs=reservationsFor(itemId);if(!rs.length)return null;
+  return el("div",{class:"resv"},...rs.map(r=>el("div",{class:"resv-line"},
+    document.createTextNode(r.reserved?`🔒 ${r.reserved} ${r.reserved===1?"has":"have"} been deducted and reserved for project `:"⚠ Needed for project "),
+    el("button",{type:"button",class:"linkbtn",text:r.p.name,title:"Open this project on the Projects Calendar",onclick:()=>goToProject(r.p.id)}),
+    r.reserved<r.qty?document.createTextNode(` (${r.qty-r.reserved} more needed)`):null)));
+}
+function neededForProjects(itemId){return reservationsFor(itemId).reduce((n,r)=>n+r.reserved,0)}
+async function deductProjectInventory(p,data){
+  const list=(data.inventoryItems||[]).filter(x=>!x.used&&invById(x.itemId));if(!list.length)return;
+  const msg="Take the inventory used on this project out of stock?\n\n"+list.map(x=>{const it=invById(x.itemId);return `• ${x.qty} × ${it.name}: ${it.qty} → ${Math.max(0,Number(it.qty)-Number(x.qty))}`}).join("\n");
+  if(!confirm(msg))return;
+  const nowLow=[];
+  for(const x of list){const it=invById(x.itemId),n=Math.max(0,Number(it.qty)-Number(x.qty));
+    if(!isLow(it)&&isLow({...it,qty:n}))nowLow.push(it.name);await bumpInv(it,-Number(x.qty))}
+  const upd={...data,status:"Done",inventoryItems:data.inventoryItems.map(x=>list.some(y=>y.itemId===x.itemId)?{...x,used:true}:x)};
+  await saveProject(p.id,upd);
+  toast(nowLow.length?`Inventory updated. ⚠ ${nowLow.join(", ")} now below minimum.`:"Inventory updated.");
+}
+function supplyRow(x){
+  const item=el("input",{type:"text",class:"sup-item",maxlength:"120",placeholder:"Item, e.g. Cat6 cable (1000 ft box)","aria-label":"Supply item"});item.value=x&&x.item||"";
+  const qty=el("input",{type:"number",class:"sup-qty",min:"1",max:"9999",step:"1","aria-label":"Quantity"});qty.value=x&&x.qty||1;
+  const got=el("input",{type:"checkbox"});got.checked=!!(x&&x.got);
+  const row=el("div",{class:"sup-row"+(got.checked?" got":"")},item,qty,el("label",{class:"sup-got"},got,el("span",{text:"Have it"})),
+    el("button",{type:"button",class:"sup-x","aria-label":"Remove item",title:"Remove item",text:"×",onclick:()=>{row.remove();if(!$("pSupplies").children.length)$("pSupplies").append(supplyRow())}}));
+  got.addEventListener("change",()=>row.classList.toggle("got",got.checked));
+  item.addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();const r=supplyRow();row.after(r);r.querySelector(".sup-item").focus()}});
+  return row;
+}
+function renderSupplies(list){const box=$("pSupplies");box.replaceChildren();(list&&list.length?list:[null]).forEach(x=>box.append(supplyRow(x)))}
+function readSupplies(){return [...$("pSupplies").querySelectorAll(".sup-row")].map(r=>({item:r.querySelector(".sup-item").value.trim(),qty:Math.max(1,Math.round(Number(r.querySelector(".sup-qty").value)||1)),got:r.querySelector("input[type=checkbox]").checked})).filter(x=>x.item)}
+function suppliesLine(p){
+  const s=p.supplies||[];if(!s.length)return null;
+  const need=s.filter(x=>!x.got);
+  if(!need.length)return el("div",{class:"psup ready",text:`Supplies: all ${s.length} ready`});
+  return el("div",{class:"psup"},el("b",{text:`Supplies needed (${need.length} of ${s.length}): `}),document.createTextNode(need.map(x=>x.item+(x.qty>1?` ×${x.qty}`:"")).join(", ")));
+}
+on("supAdd","click",()=>{const r=supplyRow();$("pSupplies").append(r);r.querySelector(".sup-item").focus()});
+// Every Cancel button simply closes its window, without checking the form.
+document.querySelectorAll('dialog button[value="cancel"]').forEach(b=>{b.type="button";b.addEventListener("click",()=>b.closest("dialog").close())});
+function projPeople(p){return (p.people||[]).map(empById).filter(Boolean)}
+function projOn(d){return (state.projects||[]).filter(p=>p.start<=d&&p.end>=d&&projMatches(p)).sort((a,b)=>a.start.localeCompare(b.start)||a.name.localeCompare(b.name))}
+function renderProjects(){
+  const cal=$("projCal");if(!cal)return;cal.replaceChildren();
+  const m=state.projMonth,t=todayIso(),max=state.projFull?8:4;
+  renderProjStats();
+  $("pjLabel").textContent=m.toLocaleDateString(undefined,{month:"long",year:"numeric"});
+  for(const d of ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"])cal.append(el("div",{class:"dow",text:d}));
+  const lead=(m.getDay()+6)%7;for(let i=0;i<lead;i++)cal.append(el("div",{class:"day pad","aria-hidden":"true"}));
+  const days=new Date(m.getFullYear(),m.getMonth()+1,0).getDate();
+  for(let n=1;n<=days;n++){
+    const dt=new Date(m.getFullYear(),m.getMonth(),n),di=iso(dt),list=projOn(di);
+    const cell=el("div",{class:"day"+(isWeekday(dt)?"":" wknd")+(di===t?" is-today":""),title:"Add a project starting "+longDate(di)},
+      el("div",{class:"dnum"},di===t?el("b",{text:String(n)}):el("span",{text:String(n)}),list.length?el("span",{class:"cnt",text:list.length+(list.length===1?" project":" projects")}):null));
+    cell.addEventListener("click",()=>openProject(null,di));
+    list.slice(0,max).forEach(p=>{
+      const who=projPeople(p).map(e=>firstName(e.name)).join(", ");
+      const label=`${p.name}${who?": "+who:""}${p.location?" ("+locShort(p.location)+")":""}`;
+      const chip=el("button",{type:"button",class:"pchip"+(p.status==="Done"?" done":"")+(p.status==="On hold"?" hold":""),style:`--pjc:${p.status==="Done"?"var(--brand)":projColor(p)}`,
+        title:`${p.name}\n${fmtRange(p.start,p.end)} · ${statusLabel(p.status)}${who?"\n"+who:""}${p.location?"\n"+p.location:""}${p.department?"\n"+p.department:""}${(p.equipment||[]).length?"\nEquipment: "+p.equipment.join(", "):""}${lastUpdate(p)&&p.status!=="Done"?"\nNext: "+lastUpdate(p).todo:""}`,
+        "aria-label":`${label}, ${statusLabel(p.status)}. Open project.`,text:(p.status==="Done"?"✓ ":"")+(state.projFull?label:p.name)});
+      chip.addEventListener("click",e=>{e.stopPropagation();openProject(p)});
+      cell.append(chip);
+    });
+    if(list.length>max)cell.append(el("div",{class:"pmore",text:`+${list.length-max} more`}));
+    cal.append(cell);
+  }
+  const trail=(7-((lead+days)%7))%7;for(let i=0;i<trail;i++)cal.append(el("div",{class:"day pad","aria-hidden":"true"}));
+  // list
+  const box=$("projList");box.replaceChildren();
+  const f=state.projFilter||"all";
+  const rows=(state.projects||[]).filter(projMatches).sort(f==="completed"
+    ?(a,b)=>String(b.completedAt||b.end).localeCompare(String(a.completedAt||a.end))
+    :(a,b)=>((a.status==="Done")-(b.status==="Done"))||((a.end<t)-(b.end<t))||a.start.localeCompare(b.start));
+  $("projListTitle").textContent=`${PROJ_FILTERS[f].label} (${rows.length})`;
+  if(!rows.length){box.append(el("div",{class:"empty"},el("div",{text:f==="ongoing"?"No ongoing projects right now.":f==="completed"?"No completed projects yet.":"No projects yet."}),el("button",{class:"btn primary wbtn",type:"button",text:"Add project",onclick:()=>openProject(null)})));return}
+  const tbl=el("table"),tb=el("tbody");
+  tbl.append(el("thead",null,el("tr",null,el("th",{text:"Project"}),el("th",{text:"Dates"}),el("th",{text:"Who"}),el("th",{text:"Location / Department"}),el("th",{text:"Status"}),el("th",null))));
+  for(const p of rows){
+    tb.append(el("tr",null,
+      el("td",null,el("span",{class:"pswatch",style:`--pjc:${p.status==="Done"?"var(--brand)":projColor(p)}`}),el("span",{class:"emp-name",text:p.name}),p.notes?el("div",{class:"note",text:p.notes}):null,
+                projInvLine(p),
+        (p.equipment||[]).length?el("div",{class:"pequip"},el("b",{text:"Equipment: "}),document.createTextNode(p.equipment.join(", "))):null,
+        lastUpdate(p)?el("div",{class:"plast"},el("b",{text:"Left off: "}),document.createTextNode(lastUpdate(p).leftOff),el("br"),el("b",{text:"Still to do: "}),document.createTextNode(lastUpdate(p).todo)):null),
+      el("td",{style:"white-space:nowrap",text:fmtRange(p.start,p.end)+(p.start<=t?" (now)":"")}),
+      el("td",{text:projPeople(p).map(e=>e.name).join(", ")||"—"}),
+      el("td",null,document.createTextNode(p.location?locShort(p.location):"—"),p.department?el("div",{class:"note",text:p.department}):null),
+      el("td",{text:statusLabel(p.status)}),
+      el("td",{class:"num",style:"white-space:nowrap"},
+        el("button",{class:"btn ghost wbtn",type:"button",text:"Edit","aria-label":`Edit ${p.name}`,onclick:()=>openProject(p)}),
+        el("button",{class:"btn ghost danger wbtn",type:"button",text:"Delete","aria-label":`Delete ${p.name}`,onclick:()=>confirmDeleteProject(p)}))));
+  }
+  tbl.append(tb);box.append(tbl);
+}
+function openProject(p,startDate){
+    state.projCtx=p||null;const t=startDate||todayIso();
+  $("projTitle").textContent=p?`Edit ${p.name}`:"Add project";
+  $("pName").value=p?p.name:"";$("pStart").value=p?p.start:t;$("pEnd").value=p?p.end:t;
+  $("pStatus").value=p?(p.status||"Planned"):"Planned";$("pLoc").value=p?(p.location||""):"";$("pDept").value=p?(p.department||""):"";$("pNotes").value=p?(p.notes||""):"";
+  const box=$("pPeople");box.replaceChildren();const sel=new Set(p?p.people||[]:[]);
+  sortedEmps().forEach(e=>{const cb=el("input",{type:"checkbox",value:e.id});cb.checked=sel.has(e.id);box.append(el("label",null,cb,el("span",{text:e.name})))});
+  if(!state.employees.length)box.append(el("span",{class:"emp-role",text:"Add team members first to assign people."}));
+  renderProjInv(p?p.inventoryItems:[]);
+  const eq=new Set(p&&p.equipment||[]);$("pEquip").querySelectorAll("input").forEach(c=>c.checked=eq.has(c.value));renderSlWhere();updateSlBox();
+  $("projDel").hidden=!p;$("projErr").textContent="";
+  $("projProgress").hidden=!p;if(p)renderProjUpdates(p);
+  $("projDlg").showModal();$("pName").focus();
+}
+function renderProjUpdates(p){
+  const box=$("projUpdates");box.replaceChildren();
+  if(p.status==="Done"&&p.completedAt)box.append(el("div",{class:"pupd done"},el("div",{class:"meta",text:`Completed ${fmtStamp(p.completedAt)}${p.completedBy?" by "+p.completedBy:""}`})));
+  const u=[...(p.updates||[])].reverse();
+  if(!u.length&&p.status!=="Done"){box.append(el("p",{class:"emp-role",style:"margin:0 0 8px",text:"No progress notes yet. Select Ongoing project to leave notes for the next person."}));return}
+  u.forEach(x=>box.append(el("div",{class:"pupd"},el("div",{class:"meta",text:`${fmtStamp(x.at)}${x.by?" · "+x.by:""}`}),
+    el("div",null,el("b",{text:"Left off: "}),document.createTextNode(x.leftOff)),el("div",null,el("b",{text:"Still to do: "}),document.createTextNode(x.todo)))));
+}
+function projFormData(){
+  const name=$("pName").value.trim(),start=$("pStart").value,end=$("pEnd").value;
+  if(!name)return {error:"Give the project a name."};
+  if(!start||!end||end<start)return {error:"The end date must be on or after the start date."};
+  return {data:{name,start,end,status:$("pStatus").value,location:$("pLoc").value,department:$("pDept").value,notes:$("pNotes").value.trim(),
+    people:[...$("pPeople").querySelectorAll("input:checked")].map(c=>c.value),supplies:(state.projCtx&&state.projCtx.supplies)||[],inventoryItems:readProjInv(),equipment:[...$("pEquip").querySelectorAll("input:checked")].map(c=>c.value),}};
+}
+on("projDoneBtn","click",async()=>{
+  const p=state.projCtx;if(!p)return;const f=projFormData();if(f.error){$("projErr").textContent=f.error;return}
+  if(!confirm(`Mark “${f.data.name}” as completed?`))return;
+  const ok=await write(async()=>{await api("projects/"+encodeURIComponent(p.id),"PUT",f.data);await api("projects/"+encodeURIComponent(p.id)+"/complete","POST",{})});
+  if(ok){$("projDlg").close();toast(`${f.data.name} marked completed`)}
+});
+on("pInvAdd","click",()=>{const r=projInvRow();$("pInvItems").append(r);r.querySelector(".pi-item").focus()});
+on("projOngoingBtn","click",()=>{
+  const p=state.projCtx;if(!p)return;const f=projFormData();if(f.error){$("projErr").textContent=f.error;return}
+  $("ongoingTitle").textContent=`Ongoing: ${f.data.name}`;$("oLeft").value="";$("oTodo").value="";$("ongoingErr").textContent="";
+  $("ongoingDlg").showModal();$("oLeft").focus();
+});
+on("ongoingForm","submit",async ev=>{
+  if(ev.submitter&&ev.submitter.value==="cancel")return;
+  ev.preventDefault();
+  const leftOff=$("oLeft").value.trim(),todo=$("oTodo").value.trim();
+  if(!leftOff){$("ongoingErr").textContent="Describe where you left off.";$("oLeft").focus();return}
+  if(!todo){$("ongoingErr").textContent="List what still needs to be completed.";$("oTodo").focus();return}
+  const p=state.projCtx,f=projFormData();if(!p||f.error){$("ongoingErr").textContent=f.error||"Project not found.";return}
+  const ok=await write(async()=>{await api("projects/"+encodeURIComponent(p.id),"PUT",f.data);await api("projects/"+encodeURIComponent(p.id)+"/progress","POST",{leftOff,todo})});
+  if(ok){$("ongoingDlg").close();$("projDlg").close();toast(`Progress notes saved for ${f.data.name}`)}
+});
+async function saveProject(id,data){return write(()=>id?api("projects/"+encodeURIComponent(id),"PUT",data):api("projects","POST",data))}
+async function deleteProject(id){return write(()=>api("projects/"+encodeURIComponent(id),"DELETE"))}
+async function confirmDeleteProject(p){if(confirm(`Delete the project “${p.name}”? This can’t be undone.`)){if(await deleteProject(p.id))toast("Project deleted")}}
+on("pStart","change",()=>{const s=$("pStart").value,e=$("pEnd").value;if(s&&(!e||e<s))$("pEnd").value=s});
+on("projForm","submit",async ev=>{
+  if(ev.submitter&&ev.submitter.value==="cancel")return;
+  ev.preventDefault();
+  const f=projFormData();if(f.error){$("projErr").textContent=f.error;return}
+  const p=state.projCtx,data=f.data,start=data.start;
+  if(await saveProject(p?p.id:null,data)){$("projDlg").close();toast(p?"Project updated":"Project added");
+    const pm=firstOfMonth(parse(start));if(!p&&pm.getTime()!==state.projMonth.getTime()){state.projMonth=pm;renderProjects();applyWriteState()}}
+});
+on("projDel","click",async()=>{const p=state.projCtx;if(p&&confirm(`Delete the project “${p.name}”? This can’t be undone.`)){if(await deleteProject(p.id)){$("projDlg").close();toast("Project deleted")}}});
+on("pjPrev","click",()=>{const m=state.projMonth;state.projMonth=new Date(m.getFullYear(),m.getMonth()-1,1);renderProjects();applyWriteState()});
+on("pjNext","click",()=>{const m=state.projMonth;state.projMonth=new Date(m.getFullYear(),m.getMonth()+1,1);renderProjects();applyWriteState()});
+on("pjToday","click",()=>{state.projMonth=firstOfMonth(new Date());renderProjects();applyWriteState()});
+on("pjAdd","click",()=>openProject(null));
+function setProjFull(on){
+  const p=$("projPanel"),b=$("pjFull");
+  state.projFull=on;p.classList.toggle("cal-full",on);document.body.classList.toggle("cal-open",on||!!state.calFull);
+  b.textContent=on?"⤡ Exit full screen":"⤢ Full screen";b.setAttribute("aria-pressed",String(on));
+  try{if(on&&p.requestFullscreen&&!document.fullscreenElement)p.requestFullscreen().catch(()=>{});if(!on&&document.fullscreenElement)document.exitFullscreen().catch(()=>{})}catch(_){}
+  renderProjects();applyWriteState();b.focus();
+}
+on("pjFull","click",()=>setProjFull(!state.projFull));
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&state.projFull&&!document.querySelector("dialog[open]"))setProjFull(false)});
+document.addEventListener("fullscreenchange",()=>{if(!document.fullscreenElement&&state.projFull)setProjFull(false)});
+/* ---------- 4-digit PIN to confirm who is adding or signing out inventory (checked on the server) ---------- */
+async function checkPin(name,pin){
+  const e=state.employees.find(x=>x.name===name)||(state.viewers||[]).find(x=>x.name===name);if(!e)return "Choose a name from the list.";
+  if(!e.hasPin)return `${name} doesn’t have a PIN yet. A manager can set one by editing ${firstName(name)} on the Schedule page.`;
+  if(!/^\d{4}$/.test(pin||""))return `Enter ${firstName(name)}’s 4-digit PIN.`;
+  return null;
+}
+/* ---------- inventory ---------- */
+const money=n=>n==null||n===""||isNaN(Number(n))?"—":Number(n).toLocaleString("en-US",{style:"currency",currency:"USD"});
+const hasMin=x=>x.min!=null&&x.min!==""&&!isNaN(Number(x.min));
+const isLow=x=>hasMin(x)&&Number(x.qty)<Number(x.min);
+const INV_FILTERS={all:{label:"All items",test:()=>true},low:{label:"Low inventory",test:isLow},out:{label:"Out of stock",test:x=>Number(x.qty)<=0}};
+function invStatus(x){return Number(x.qty)<=0?"out":isLow(x)?"low":"ok"}
+function invThumb(x,big){return x.image?el("img",{class:"inv-thumb",src:x.image,alt:"",loading:"lazy"}):el("span",{class:"inv-thumb none","aria-hidden":"true",text:"📦"})}
+function invFiltered(){
+  const q=($("invSearch").value||"").trim().toLowerCase(),c=($("invCat")||{}).value||"",f=INV_FILTERS[state.invFilter||"all"];
+  return (state.inventory||[]).filter(x=>f.test(x)&&invInFolder(x)&&(!c||catOf(x.category)===c)&&(!q||[x.name,x.notes,x.location,x.category].some(v=>String(v||"").toLowerCase().includes(q))))
+    .sort((a,b)=>({out:0,low:1,ok:2}[invStatus(a)]-{out:0,low:1,ok:2}[invStatus(b)])||a.name.localeCompare(b.name));
+}
+function renderInvBadge(){
+  const n=(state.inventory||[]).filter(isLow).length;
+  ["tabInv","navInv"].forEach(id=>{const t=$(id);if(!t)return;let b=t.querySelector(".tab-badge");if(!b){b=el("span",{class:"tab-badge"});t.append(b)}
+    b.textContent=n?String(n):"";b.title=n?`${n} item${n===1?"":"s"} below minimum level`:"";});
+}
+function renderInventory(){
+  renderInvBadge();if($("invMetrics")&&!$("invMetrics").hidden)renderMetrics();
+  const box=$("invList");if(!box)return;box.replaceChildren();
+  const all=state.inventory||[];
+  // Low Inventory Items section
+  const low=all.filter(isLow).sort((a,b)=>(Number(a.qty)/Number(a.min))-(Number(b.qty)/Number(b.min))),lb=$("lowList");lb.replaceChildren();
+  if(!state.lowSel)state.lowSel=new Set();
+  for(const id of [...state.lowSel])if(!low.some(x=>x.id===id))state.lowSel.delete(id);
+  $("lowCount").textContent=low.length?`${low.length} below minimum`:"";
+  $("lowAllWrap").hidden=$("lowHint").hidden=!low.length;
+  if(!low.length)lb.append(el("div",{class:"low-empty",text:all.length?"✓ Every item is at or above its Minimum Level.":"Items that drop below their Minimum Level will show here."}));
+  else for(const x of low){
+    const cb=el("input",{type:"checkbox","aria-label":`Add ${x.name} to the restock email`});cb.checked=state.lowSel.has(x.id);
+    cb.addEventListener("change",()=>{cb.checked?state.lowSel.add(x.id):state.lowSel.delete(x.id);card.classList.toggle("sel",cb.checked);updateRestockMail()});
+    const card=el("div",{class:"low-card"+(Number(x.qty)<=0?" out":"")+(cb.checked?" sel":"")},el("label",{class:"low-check",title:"Include in restock email"},cb),invThumb(x),
+      el("div",null,el("div",{class:"nm",text:x.name,title:x.name}),
+        el("div",{class:"meta",text:`${x.qty} on hand · minimum ${x.min}${x.location?" · "+locShort(x.location):""}`}),onOrderQty(x.id)?el("div",{class:"onorder",text:`📦 ${onOrderQty(x.id)} on order`}):null,
+        el("div",{class:"acts"},el("button",{class:"btn small wbtn",type:"button",text:"+ Restock",onclick:()=>openInvMore(x)}))));
+    lb.append(card);
+  }
+  updateRestockMail();
+  renderInvFolders();renderSignouts();
+  // Summary boxes (for the location folder and item type being viewed)
+  const cat=($("invCat")||{}).value||"",scope=all.filter(x=>invInFolder(x)&&(!cat||catOf(x.category)===cat));
+  const st=$("invStats");st.replaceChildren();
+  const units=scope.reduce((n,x)=>n+(Number(x.qty)||0),0),value=scope.reduce((n,x)=>n+(Number(x.qty)||0)*(Number(x.cost)||0),0);
+  for(const [key,f] of Object.entries(INV_FILTERS)){
+    const n=scope.filter(f.test).length,on=(state.invFilter||"all")===key;
+    const sub=key==="all"?` · ${units} units · ${money(value)}`:"";
+    st.append(el("button",{type:"button",class:"pstat pstat-"+key+(on?" on":""),"aria-pressed":String(on),
+      "aria-label":`${f.label}: ${n}. ${on?"Showing":"Show"} ${f.label.toLowerCase()}.`,
+      onclick:()=>{state.invFilter=key;renderInventory();applyWriteState()}},el("strong",{text:String(n)}),el("span",{text:f.label+sub})));
+  }
+  const rows=invFiltered();
+  if(!rows.length){box.append(el("div",{class:"empty"},el("div",{text:all.length?"No items match these filters.":"No inventory yet. Select Add Inventory to add your first item."}),
+    all.length?null:el("button",{class:"btn primary wbtn",type:"button",text:"+ Add Inventory",onclick:()=>openInv(null)})));return}
+  const tbl=el("table"),tb=el("tbody");
+  tbl.append(el("thead",null,el("tr",null,el("th",{text:"Image"}),el("th",{text:"Item Name"}),el("th",{text:"Type"}),el("th",{class:"num",text:"Item Cost"}),el("th",{text:"Location Stored At"}),
+    el("th",{text:"Quantity"}),el("th",{class:"num",text:"Minimum Level"}),el("th",{text:"Status"}),el("th",null))));
+  for(const x of rows){
+    const s=invStatus(x);
+    tb.append(el("tr",null,
+      el("td",null,invThumb(x)),
+      el("td",null,el("div",{class:"emp-name",text:x.name}),onOrderQty(x.id)?el("div",{class:"onorder",text:`📦 ${onOrderQty(x.id)} on order`}):null,reservationNotes(x.id),x.notes?el("div",{class:"note",text:x.notes}):null),
+      el("td",{text:catOf(x.category)||"—"}),
+      el("td",{class:"num",text:money(x.cost)}),
+      el("td",{text:x.location?locShort(x.location):"—",title:x.location||""}),
+      el("td",null,el("span",{class:"inv-qty-plain",text:String(x.qty)})),
+      el("td",{class:"num",text:hasMin(x)?String(x.min):"—"}),
+      el("td",null,el("span",{class:"ist "+s,text:s==="out"?"Out of stock":s==="low"?"⚠ Below minimum":"In stock"})),
+      el("td",{class:"num",style:"white-space:nowrap"},
+        Number(x.qty)>0?el("button",{class:"btn small wbtn",type:"button",text:"⇩ Sign out","aria-label":`Sign out ${x.name}`,onclick:()=>openSignOut(x)}):null,
+        el("button",{class:"btn ghost wbtn",type:"button",text:"Edit","aria-label":`Edit ${x.name}`,onclick:()=>openInv(x)}),
+        el("button",{class:"btn ghost danger wbtn",type:"button",text:"Delete","aria-label":`Delete ${x.name}`,onclick:()=>confirmDeleteInv(x)}))));
+  }
+  tbl.append(tb);box.append(tbl);
+}
+/* Restock email for the checked Low Inventory Items (opens in the default mail app, e.g. Outlook classic) */
+const RESTOCK_TO="IT@lesterglenn.com",RESTOCK_SUBJECT="Amazon Supplies";
+function restockItems(){const sel=state.lowSel||new Set();return (state.inventory||[]).filter(x=>sel.has(x.id)&&isLow(x)).sort((a,b)=>a.name.localeCompare(b.name))}
+function restockBody(items){
+  const me=state.meName||(state.me&&state.me.name)||"";
+  const lines=items.map((x,i)=>{const need=Math.max(1,Number(x.min)-Number(x.qty));
+    return `${i+1}. ${x.name}\r\n   Current inventory: ${x.qty}  |  Minimum level: ${x.min}  |  Need at least: ${need}`+
+      (x.location?`\r\n   Stored at: ${x.location}`:"")+(x.cost!=null&&x.cost!==""?`\r\n   Item cost: ${money(x.cost)} each`:"")});
+  return `Hello,\r\n\r\nThe following IT supplies are below their minimum inventory level and need to be restocked:\r\n\r\n${lines.join("\r\n\r\n")}\r\n\r\nThank you${me?",\r\n"+me:""}`;
+}
+function updateRestockMail(){
+  const a=$("restockMail");if(!a)return;
+  const low=(state.inventory||[]).filter(isLow),items=restockItems(),all=$("lowAll");
+  if(all){all.checked=!!low.length&&items.length===low.length;all.indeterminate=items.length>0&&items.length<low.length}
+  a.textContent=items.length?`✉ Email Inventory Restock (${items.length})`:"✉ Email Inventory Restock";
+  if(!items.length){a.removeAttribute("href");a.setAttribute("aria-disabled","true");a.title=low.length?"Check at least one item first":"No items are below their minimum";return}
+  const href=`mailto:${RESTOCK_TO}?subject=${encodeURIComponent(RESTOCK_SUBJECT)}&body=${encodeURIComponent(restockBody(items))}`;
+  a.href=href;a.removeAttribute("aria-disabled");
+  a.title=href.length>1900?"That’s a long list. If the email doesn’t open, check fewer items and send in two emails.":`Email ${RESTOCK_TO} about ${items.length} item${items.length===1?"":"s"}`;
+}
+(function(){
+  const all=$("lowAll");if(all)all.addEventListener("change",()=>{
+    const low=(state.inventory||[]).filter(isLow);state.lowSel=new Set(all.checked?low.map(x=>x.id):[]);renderInventory();applyWriteState()});
+  const a=$("restockMail");if(a)a.addEventListener("click",e=>{
+    if(a.getAttribute("aria-disabled")==="true"){e.preventDefault();toast("Check the items you want to restock first.");return}
+    if(a.href.length>1900)toast("Long list: if Outlook doesn’t open, check fewer items and send in two emails.");
+  });
+})();
+function lowAlert(name,qty,min){toast(`⚠ Low inventory: ${name} is down to ${qty} (minimum ${min}).`)}
+async function bumpInvAlert(x,d){
+  const before=isLow(x),n=Math.max(0,(Number(x.qty)||0)+d);
+  const ok=await bumpInv(x,d);
+  if(ok&&!before&&isLow({...x,qty:n}))lowAlert(x.name,n,x.min);
+}
+function setInvPreview(src){const p=$("iImgPrev");p.style.backgroundImage=src?`url("${src}")`:"";p.classList.toggle("has",!!src);$("iImgClear").hidden=!src}
+function readImage(file){
+  return new Promise((res,rej)=>{
+    if(!file||!/^image\//.test(file.type))return rej(new Error("Choose an image file (JPG or PNG)."));
+    const fr=new FileReader();
+    fr.onerror=()=>rej(new Error("That image couldn’t be read."));
+    fr.onload=()=>{const img=new Image();
+      img.onload=()=>{const max=360,sc=Math.min(1,max/Math.max(img.width,img.height)),c=document.createElement("canvas");
+        c.width=Math.max(1,Math.round(img.width*sc));c.height=Math.max(1,Math.round(img.height*sc));
+        const g=c.getContext("2d");g.fillStyle="#fff";g.fillRect(0,0,c.width,c.height);g.drawImage(img,0,0,c.width,c.height);res(c.toDataURL("image/jpeg",0.82))};
+      img.onerror=()=>rej(new Error("That image type isn’t supported here. Try a JPG or PNG."));img.src=fr.result};
+    fr.readAsDataURL(file);
+  });
+}
+function openInv(x){
+  state.invCtx=x||null;state.invImg={mode:"keep",data:null};
+  $("invTitle").textContent=x?`Edit ${x.name}`:"Add Inventory";
+  $("iName").value=x?x.name:"";$("iCost").value=x&&x.cost!=null&&x.cost!==""?Number(x.cost).toFixed(2):"";
+  $("iLoc").value=x?(x.location||""):(state.invFolder&&state.invFolder!=="__none__"?state.invFolder:"");$("iCat").value=x&&INV_CATS.includes(catOf(x.category))?catOf(x.category):(($("invCat")||{}).value||"Misc");$("iQty").value=x?x.qty:1;
+  $("iMin").value=x&&hasMin(x)?x.min:"";$("iNotes").value=x?(x.notes||""):"";$("iImg").value="";
+  setInvPreview(x&&x.image?x.image:"");
+  $("invModeWrap").hidden=!!x;$("invWhoField").hidden=!!x;$("mPin").value="";if(!x)fillAddedBy(true);setInvMode("new");$("mQty").value=1;$("mCost").value="";$("mNotes").value="";$("iDup").hidden=true;
+  $("invDel").hidden=!x;$("invErr").textContent="";$("invDlg").showModal();$("iName").focus();
+}
+async function confirmDeleteInv(x){if(confirm(`Delete “${x.name}” from inventory?`)){if(await deleteInv(x.id))toast("Item deleted")}}
+function wireInventory(){
+  const onEl=(id,ev,fn)=>{const e=$(id);if(e)e.addEventListener(ev,fn)};
+  onEl("invAdd","click",()=>openInv(null));
+  onEl("invSearch","input",()=>{renderInventory();applyWriteState()});
+  onEl("iImg","change",async e=>{
+    const f=e.target.files&&e.target.files[0];if(!f)return;$("invErr").textContent="";
+    try{const data=await readImage(f);state.invImg={mode:"new",data};setInvPreview(data)}catch(err){$("invErr").textContent=err.message;e.target.value=""}
+  });
+  onEl("iImgClear","click",()=>{state.invImg={mode:"clear",data:null};$("iImg").value="";setInvPreview("")});
+  onEl("invDel","click",async()=>{const x=state.invCtx;if(x&&confirm(`Delete “${x.name}” from inventory?`)){if(await deleteInv(x.id)){$("invDlg").close();toast("Item deleted")}}});
+  onEl("invForm","submit",async ev=>{
+    if(ev.submitter&&ev.submitter.value==="cancel")return;
+    ev.preventDefault();
+    if(invMode()==="more"&&!state.invCtx){await submitInvMore();return}
+    const name=$("iName").value.trim(),qty=Math.round(Number($("iQty").value)),minRaw=$("iMin").value.trim(),costRaw=$("iCost").value.trim();
+    if(!name){$("invErr").textContent="Enter the Item Name.";return}
+    if(!(qty>=0)){$("invErr").textContent="Quantity must be 0 or more.";return}
+    if(costRaw!==""&&!(Number(costRaw)>=0)){$("invErr").textContent="Item Cost must be 0 or more.";return}
+    const x=state.invCtx,data={name,category:$("iCat").value,cost:costRaw===""?null:Math.round(Number(costRaw)*100)/100,location:$("iLoc").value,qty,
+      min:minRaw===""?null:Math.max(0,Math.round(Number(minRaw))||0),notes:$("iNotes").value.trim()};
+    const im=state.invImg||{mode:"keep"};if(im.mode==="new")data.image=im.data;else if(im.mode==="clear")data.image="";
+    if(!x){
+      if(!$("mWho").value){$("invErr").textContent="Choose who is adding this item.";$("mWho").focus();return}
+      {const pe=await checkPin($("mWho").value,$("mPin").value);if(pe){$("invErr").textContent=pe;$("mPin").focus();return}}
+      data.addedBy=$("mWho").value;
+    }
+    const wasLow=x?isLow(x):false;
+    const saved=await saveInv(x?x.id:null,data,x?"":$("mPin").value);
+    if(saved&&!x)await logNewItem(saved,data);
+    if(saved){
+      $("invDlg").close();
+      if(isLow(data)&&!wasLow)lowAlert(name,qty,data.min);else toast(x?"Item updated":"Item added to inventory");
+    }
+  });
+  onEl("invCsv","click",async()=>{
+    const q=v=>`"${String(v??"").replace(/"/g,'""')}"`;
+    const lines=[["Item Name","Type","Item Cost","Location Stored At","Quantity","Minimum Level","Total Value","Status","Notes"].map(q).join(",")];
+    for(const x of invFiltered()){const s=invStatus(x);lines.push([x.name,x.category||"",x.cost??"",x.location,x.qty,hasMin(x)?x.min:"",x.cost!=null&&x.cost!==""?(Number(x.cost)*Number(x.qty)).toFixed(2):"",s==="out"?"Out of stock":s==="low"?"Below minimum":"In stock",x.notes].map(q).join(","))}
+    await saveCsv(`it-inventory-${todayIso()}.csv`,lines.join("\n"));
+  });
+}
+wireInventory();
+async function saveInv(id,data,pin){return write(()=>id?api("inventory/"+encodeURIComponent(id),"PUT",data):api("inventory","POST",{...data,pin}))}
+async function deleteInv(id){return write(()=>api("inventory/"+encodeURIComponent(id),"DELETE"))}
+async function bumpInv(x,d){if(d<0&&Number(x.qty)<=0)return false;return write(()=>api("inventory/"+encodeURIComponent(x.id)+"/adjust","POST",{delta:d}))}
+/* ---------- sign out inventory ---------- */
+const INV_CATS=["Monitors", "Keyboards", "Mouse", "PCs", "Laptops", "Tablets", "iPad", "iPhone", "Printers", "IP Phones", "Conference Device", "Web Cams", "USB Headsets", "IP Phone Headsets", "Cables", "Networking", "Misc"];
+// Older item types map onto the new list.
+const OLD_CATS={"Desktops": "PCs", "Keyboards & Mice": "Keyboards", "Phones": "IP Phones", "Printers & Toner": "Printers"};
+const catOf=c=>OLD_CATS[c]||c;
+function renderInvFolders(){
+  const box=$("invFolders");if(!box)return;box.replaceChildren();
+  const all=state.inventory||[],locs=[...new Set(all.map(x=>x.location||""))].sort((a,b)=>(a===""?1:b===""?-1:a.localeCompare(b)));
+  if(state.invFolder&&!locs.includes(state.invFolder))state.invFolder="";
+  const add=(val,label,n)=>{const on=(state.invFolder||"")===val;
+    box.append(el("button",{type:"button",role:"tab",class:"inv-folder","aria-selected":String(on),title:val||"All locations",
+      onclick:()=>{state.invFolder=val;renderInventory();applyWriteState()}},document.createTextNode((val===""&&label==="All locations"?"🗂 ":"📁 ")+label),el("span",{class:"n",text:`(${n})`})))};
+  add("","All locations",all.length);
+  locs.forEach(l=>{if(l==="")add("__none__","No location set",all.filter(x=>!x.location).length);else add(l,locShort(l),all.filter(x=>x.location===l).length)});
+}
+function invInFolder(x){const f=state.invFolder||"";return !f||(f==="__none__"?!x.location:x.location===f)}
+function updateSoAvail(){
+  const it=invById($("soItem").value),n=Math.max(1,Math.round(Number($("soQty").value)||1)),a=$("soAvail");
+  if(!it){a.textContent="";return}
+  a.textContent=n>Number(it.qty)?`⚠ Only ${it.qty} on hand`:`${it.qty} on hand → ${Number(it.qty)-n} after`;
+  a.className=n>Number(it.qty)?"over":"so-after";
+}
+function openSignOut(item){
+  const items=[...(state.inventory||[])].filter(x=>Number(x.qty)>0).sort((a,b)=>a.name.localeCompare(b.name));
+  if(!items.length){toast("Nothing in stock to sign out.");return}
+  const s=$("soItem");s.replaceChildren();
+  items.forEach(x=>s.append(el("option",{value:x.id,text:`${x.name} (${x.qty} on hand${x.location?" · "+locShort(x.location):""})`})));
+  s.value=item&&Number(item.qty)>0?item.id:(items.find(invInFolder)||items[0]).id;
+  $("soQty").value=1;
+  const w=$("soWho");w.replaceChildren(el("option",{value:"",text:"Choose who’s taking it…"}));
+  sortedEmps().forEach(e=>w.append(el("option",{value:e.name,text:e.name})));
+  const me=state.meName||(state.me&&state.me.name)||"";if(me&&sortedEmps().some(e=>e.name===me))w.value=me;
+  const pj=$("soProj");pj.replaceChildren(el("option",{value:"",text:"None"}));
+  (state.projects||[]).filter(p=>p.status!=="Done").sort((a,b)=>a.start.localeCompare(b.start)).forEach(p=>pj.append(el("option",{value:p.id,text:p.name})));
+  $("soTo").value="";$("soDept").value="";$("soPin").value="";$("soNotes").value="";$("soErr").textContent="";updateSoAvail();$("soDlg").showModal();$("soQty").focus();
+}
+function wireSignOut(){
+  const onEl=(id,ev,fn)=>{const e=$(id);if(e)e.addEventListener(ev,fn)};
+  onEl("soOpen","click",()=>openSignOut(null));
+  onEl("soItem","change",updateSoAvail);onEl("soQty","input",updateSoAvail);
+  onEl("invCat","change",()=>{renderInventory();applyWriteState()});
+  onEl("soForm","submit",async ev=>{
+    if(ev.submitter&&ev.submitter.value==="cancel")return;
+    ev.preventDefault();
+    const it=invById($("soItem").value),qty=Math.round(Number($("soQty").value)),by=$("soWho").value;
+    if(!it){$("soErr").textContent="Choose an item.";return}
+    if(!(qty>=1)){$("soErr").textContent="Quantity must be at least 1.";return}
+    if(qty>Number(it.qty)){$("soErr").textContent=`Only ${it.qty} on hand.`;return}
+    if(!by){$("soErr").textContent="Choose who is signing it out.";$("soWho").focus();return}
+    {const pe=await checkPin(by,$("soPin").value);if(pe){$("soErr").textContent=pe;$("soPin").focus();return}}
+    if(!$("soDept").value){$("soErr").textContent="Choose the department it’s going to.";$("soDept").focus();return}
+    const pj=(state.projects||[]).find(p=>p.id===$("soProj").value);
+    const entry={itemId:it.id,itemName:it.name,category:it.category||"",qty,by,department:$("soDept").value,unitCost:it.cost!=null&&it.cost!==""?Number(it.cost):null,toLocation:$("soTo").value,projectId:pj?pj.id:"",projectName:pj?pj.name:"",
+      notes:$("soNotes").value.trim(),fromLocation:it.location||"",at:new Date().toISOString(),recordedBy:state.meName||(state.me&&state.me.name)||""};
+    const n=Number(it.qty)-qty,crossed=!isLow(it)&&isLow({...it,qty:n});
+    if(await signOutInv(it,entry,$("soPin").value)){$("soDlg").close();
+      if(crossed)lowAlert(it.name,n,it.min);else toast(`Signed out ${qty} × ${it.name} to ${by}. ${n} left.`)}
+  });
+}
+wireSignOut();
+/* ---------- add more of an existing item ---------- */
+function invMode(){const r=document.querySelector('input[name="imode"]:checked');return r?r.value:"new"}
+function setInvMode(m){
+  const r=document.querySelector(`input[name="imode"][value="${m}"]`);if(r)r.checked=true;
+  $("invMoreFields").hidden=m!=="more";$("invNewFields").hidden=m==="more";
+  $("iName").required=m!=="more";$("iQty").required=m!=="more";
+  $("invSave").textContent=m==="more"?"Add to inventory":"Save";
+  if(m==="more"){fillMoreItems();fillAddedBy();updateMoreAfter();$("mQty").focus()}
+}
+function fillMoreItems(sel){
+  const s=$("mItem"),keep=sel||s.value;s.replaceChildren();
+  [...(state.inventory||[])].sort((a,b)=>a.name.localeCompare(b.name)).forEach(x=>s.append(el("option",{value:x.id,text:`${x.name} (${x.qty} on hand${x.location?" · "+locShort(x.location):""})`})));
+  if(keep&&invById(keep))s.value=keep;
+}
+function fillAddedBy(force){
+  const w=$("mWho");if(!w||(!force&&w.options.length>1))return;
+  w.replaceChildren(el("option",{value:"",text:"Choose who’s adding it…"}));sortedEmps().forEach(e=>w.append(el("option",{value:e.name,text:e.name})));
+  const me=state.meName||(state.me&&state.me.name)||"";w.value=me&&sortedEmps().some(e=>e.name===me)?me:"";
+}
+function updateMoreAfter(){
+  const it=invById($("mItem").value),n=Math.max(1,Math.round(Number($("mQty").value)||1)),a=$("mAfter");
+  if(!it){a.textContent="";return}
+  const after=Number(it.qty)+n;a.textContent=`${it.qty} on hand → ${after} after`+(hasMin(it)&&Number(it.qty)<Number(it.min)&&after>=Number(it.min)?" ✓ back above minimum":"");
+  $("mCost").placeholder=it.cost!=null&&it.cost!==""?`Keep ${money(it.cost)}`:"Optional";
+}
+function openInvMore(x){
+  if(!(state.inventory||[]).length){openInv(null);return}
+  openInv(null);setInvMode("more");if(x){$("mItem").value=x.id;updateMoreAfter()}
+  const o=onOrderQty&&x?onOrderQty(x.id):0;if(o)$("mQty").value=o;updateMoreAfter();
+}
+function checkDup(){
+  const d=$("iDup");if(!d)return;const n=$("iName").value.trim().toLowerCase();
+  const m=!state.invCtx&&n?(state.inventory||[]).find(x=>x.name.trim().toLowerCase()===n):null;
+  d.replaceChildren();d.hidden=!m;if(!m)return;
+  d.append(document.createTextNode(`“${m.name}” is already in inventory (${m.qty} on hand${m.location?" at "+locShort(m.location):""}). `),
+    el("button",{type:"button",class:"btn small",text:"Add to its quantity instead",onclick:()=>{setInvMode("more");$("mItem").value=m.id;updateMoreAfter()}}));
+}
+function wireInvMore(){
+  const onEl=(id,ev,fn)=>{const e=$(id);if(e)e.addEventListener(ev,fn)};
+  document.querySelectorAll('input[name="imode"]').forEach(r=>r.addEventListener("change",()=>setInvMode(invMode())));
+  onEl("mItem","change",updateMoreAfter);onEl("mQty","input",updateMoreAfter);onEl("iName","input",checkDup);
+}
+async function submitInvMore(){
+  const it=invById($("mItem").value),n=Math.round(Number($("mQty").value)),costRaw=$("mCost").value.trim();
+  if(!it){$("invErr").textContent="Choose the item you received.";return}
+  if(!(n>=1)){$("invErr").textContent="Quantity received must be at least 1.";return}
+  if(!$("mWho").value){$("invErr").textContent="Choose who is adding this stock.";$("mWho").focus();return}
+  {const pe=await checkPin($("mWho").value,$("mPin").value);if(pe){$("invErr").textContent=pe;$("mPin").focus();return}}
+  if(costRaw!==""&&!(Number(costRaw)>=0)){$("invErr").textContent="Item Cost must be 0 or more.";return}
+  const cost=costRaw===""?null:Math.round(Number(costRaw)*100)/100,before=Number(it.qty),wasLow=isLow(it);
+  const entry={kind:"in",source:"Added to stock by hand",itemId:it.id,itemName:it.name,category:it.category||"",qty:n,by:$("mWho").value,toLocation:it.location||"",
+    projectId:"",projectName:"",notes:$("mNotes").value.trim(),fromLocation:it.location||"",at:new Date().toISOString(),recordedBy:state.meName||(state.me&&state.me.name)||""};
+  if(await addStock(it,n,cost,entry,$("mPin").value)){
+    $("invDlg").close();
+    toast(`Added ${n} × ${it.name}: ${before} → ${before+n}.`+(wasLow&&!isLow({...it,qty:before+n})?" Back above its minimum.":""));
+  }
+}
+wireInvMore();
+/* ---------- Inventory On Order as its own view ---------- */
+function showOrders(on){
+  $("invOrders").hidden=!on;["invHistory","invMetrics"].forEach(id=>{if($(id))$(id).hidden=true});
+  document.querySelectorAll(".inv-main").forEach(e=>e.hidden=on);
+  if(on){renderOrders();applyWriteState();$("ordBack").focus()}else{renderInventory();applyWriteState();$("ordOpen").focus()}
+}
+(function(){const b=$("ordOpen"),k=$("ordBack");if(b)b.addEventListener("click",()=>showOrders(true));if(k)k.addEventListener("click",()=>showOrders(false))})();
+/* ---------- inventory history (its own view) ---------- */
+state.hist={q:"",kind:"",from:"",to:"",dept:"",start:"",end:"",limit:100};
+function histFrom(s){return s.kind==="in"?(s.source||"New stock"):(s.fromLocation||"Not set")}
+function histTo(s){return s.kind==="in"?(s.toLocation||s.fromLocation||"In stock"):(s.toLocation||"Not set")}
+const histLabel=v=>/^Lester Glenn /.test(v)?locShort(v):v;
+function histRows(){
+  const H=state.hist,q=H.q.trim().toLowerCase();
+  return (state.signouts||[]).filter(s=>(!H.kind||(H.kind==="in")===(s.kind==="in"))&&(!H.from||histFrom(s)===H.from)&&(!H.to||histTo(s)===H.to)
+    &&(!H.dept||(s.department||"Not set")===H.dept)&&(!H.start||String(s.at).slice(0,10)>=H.start)&&(!H.end||String(s.at).slice(0,10)<=H.end)
+    &&(!q||[s.itemName,s.by,s.notes,s.projectName,histFrom(s),histTo(s),s.department].some(v=>String(v||"").toLowerCase().includes(q))))
+    .sort((a,b)=>String(b.at).localeCompare(String(a.at)));
+}
+function renderSignouts(){
+  const box=$("soList"),view=$("invHistory");if(!box||!view||view.hidden)return;box.replaceChildren();
+  const H=state.hist,all=state.signouts||[];
+  const opts=(id,vals,cur,lbl)=>{const s=$(id);s.replaceChildren(el("option",{value:"",text:lbl}));vals.forEach(v=>s.append(el("option",{value:v,text:histLabel(v)})));s.value=vals.includes(cur)?cur:""};
+  const uniq=f=>[...new Set(all.map(f))].sort((a,b)=>a.localeCompare(b));
+  opts("hFrom",uniq(histFrom),H.from,"Anywhere");opts("hTo",uniq(histTo),H.to,"Anywhere");
+  opts("hDept",[...new Set([...DEPTS,...all.filter(s=>s.kind!=="in").map(s=>s.department||"Not set")])],H.dept,"All departments");
+  $("hKind").value=H.kind;
+  const rows=histRows(),out=rows.filter(s=>s.kind!=="in"),inn=rows.filter(s=>s.kind==="in");
+  const val=l=>l.reduce((n,s)=>{const it=invById(s.itemId),u=s.unitCost!=null&&s.unitCost!==""?Number(s.unitCost):(it&&it.cost!=null&&it.cost!==""?Number(it.cost):0);return n+u*(Number(s.qty)||0)},0);
+  const cards=$("hCards");cards.replaceChildren();
+  [[String(rows.length),"Entries"],[String(out.reduce((n,s)=>n+Number(s.qty),0)),"Items signed out"],[String(inn.reduce((n,s)=>n+Number(s.qty),0)),"Items received / added"],[money(val(out)),"Value signed out"]]
+    .forEach(([v,l])=>cards.append(el("div",{class:"pstat"},el("strong",{text:v}),el("span",{text:l}))));
+  if(!rows.length){box.append(el("div",{class:"empty",text:all.length?"Nothing matches these filters.":"No history yet. Sign-outs, stock you add, and orders you receive will show here."}));$("soNote").textContent="";return}
+  const tbl=el("table"),tb=el("tbody");
+  tbl.append(el("thead",null,el("tr",null,el("th",{text:"When"}),el("th",{text:"Item"}),el("th",{class:"num",text:"Qty"}),el("th",{text:"Coming from"}),el("th",{text:"Going to"}),
+    el("th",{text:"Department"}),el("th",{text:"Who"}),el("th",{text:"Project"}),el("th",{text:"Notes"}))));
+  for(const s of rows.slice(0,H.limit)){
+    const fr=histFrom(s),to=histTo(s);
+    tb.append(el("tr",null,el("td",{style:"white-space:nowrap",text:fmtStamp(s.at)}),
+      el("td",null,el("div",{class:"emp-name"},document.createTextNode(s.itemName),el("span",{class:"hist-kind "+(s.kind==="in"?"in":"out"),text:s.kind==="in"?"Received":"Signed out"}))),
+      el("td",{class:"num"},el("span",{class:s.kind==="in"?"qty-in":"qty-out",text:(s.kind==="in"?"+":"−")+s.qty})),
+      el("td",{class:"hist-from",text:histLabel(fr),title:fr}),el("td",{text:histLabel(to),title:to}),
+      el("td",{text:s.kind==="in"?"—":(s.department||"—")}),el("td",{text:s.by||"—"}),el("td",{text:s.projectName||"—"}),el("td",{class:"note",text:s.notes||""})));
+  }
+  tbl.append(tb);box.append(tbl);
+  const n=$("soNote");n.replaceChildren(document.createTextNode(`Showing ${Math.min(H.limit,rows.length)} of ${rows.length}. `));
+  if(rows.length>H.limit)n.append(el("button",{type:"button",class:"linkbtn",text:"Show more",onclick:()=>{H.limit+=100;renderSignouts()}}));
+}
+function showHistory(on){
+  $("invHistory").hidden=!on;if($("invMetrics"))$("invMetrics").hidden=true;if($("invOrders"))$("invOrders").hidden=true;
+  document.querySelectorAll(".inv-main").forEach(e=>e.hidden=on);
+  if(on){state.hist.limit=100;renderSignouts();$("histBack").focus()}else{renderInventory();renderOrders();applyWriteState();$("histOpen").focus()}
+}
+function wireHistory(){
+  const onEl=(id,ev,fn)=>{const e=$(id);if(e)e.addEventListener(ev,fn)};
+  onEl("histOpen","click",()=>showHistory(true));onEl("histBack","click",()=>showHistory(false));
+  [["hSearch","q","input"],["hKind","kind","change"],["hFrom","from","change"],["hTo","to","change"],["hDept","dept","change"],["hStart","start","change"],["hEnd","end","change"]]
+    .forEach(([id,k,ev])=>onEl(id,ev,()=>{state.hist[k]=$(id).value;state.hist.limit=100;renderSignouts()}));
+  onEl("histCsv","click",async()=>{
+    const q=v=>`"${String(v??"").replace(/"/g,'""')}"`;
+    const lines=[["Date","Type","Item","Item type","Quantity","Coming from","Going to","Department","Who","Project","Notes"].map(q).join(",")];
+    histRows().forEach(s=>lines.push([s.at,s.kind==="in"?"Received":"Signed out",s.itemName,s.category,s.qty,histFrom(s),histTo(s),s.kind==="in"?"":s.department,s.by,s.projectName,s.notes].map(q).join(",")));
+    await saveCsv(`it-inventory-history-${todayIso()}.csv`,lines.join("\n"));
+  });
+}
+wireHistory();
+/* ---------- inventory metrics ---------- */
+const DEPTS=["Finance", "Sales", "Sales BDC", "Service", "Service BDC", "Marketing", "IT Dept", "Corporate", "Warranty", "Shop", "Parts"];
+const MET_COLORS=["#0772bc","#0f766e","#b45309","#7c3aed","#be185d","#4d7c0f","#9a3412","#0e7490","#a21caf","#475569","#15803d","#b91c1c"];
+state.met={year:String(new Date().getFullYear()),month:"",period:"month",store:"",dept:"",cat:"",group:"store",measure:"value",view:"table"};
+const MONTHS_FULL=["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const MET_YEARS=[2026,2027,2028,2029,2030,2031,2032];
+const MONTHS=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+function metData(){
+  return (state.signouts||[]).filter(s=>s.kind!=="in").map(s=>{
+    const it=invById(s.itemId),d=new Date(s.at);
+    const unit=s.unitCost!=null&&s.unitCost!==""?Number(s.unitCost):(it&&it.cost!=null&&it.cost!==""?Number(it.cost):0);
+    return {y:d.getFullYear(),m:d.getMonth(),store:s.toLocation||"Not set",dept:s.department||"Not set",cat:catOf(s.category||(it&&it.category)||"Misc"),
+      item:s.itemName||"Item",qty:Number(s.qty)||0,value:(Number(s.qty)||0)*unit};
+  }).filter(r=>!isNaN(r.y));
+}
+const metLabel=(g,v)=>g==="store"&&v!=="Not set"?locShort(v):v;
+function fillMetSelect(id,vals,cur,allLabel,fmt){
+  const s=$(id);if(!s)return;s.replaceChildren(el("option",{value:"",text:allLabel}));
+  vals.forEach(v=>s.append(el("option",{value:v,text:fmt?fmt(v):v})));s.value=vals.includes(cur)?cur:"";
+}
+function metPeriods(rows){
+  const M=state.met;
+  if(M.period==="year"){
+    // The year picked and the year before it (or every year with data for "All years")
+    const ys=M.year?[Number(M.year)-1,Number(M.year)]:[...new Set(rows.map(r=>r.y))].sort();
+    return ys.map(y=>({key:String(y),label:String(y),test:r=>r.y===y}));
+  }
+  if(M.year){const ms=M.month!==""?[Number(M.month)]:MONTHS.map((_,i)=>i);
+    return ms.map(i=>({key:M.year+"-"+i,label:M.month!==""?MONTHS_FULL[i]:MONTHS[i],test:r=>r.y===Number(M.year)&&r.m===i}))}
+  const ks=[...new Set(rows.map(r=>r.y*12+r.m))].sort((a,b)=>a-b).slice(-24);
+  return ks.map(k=>({key:String(k),label:`${MONTHS[k%12]} ${String(Math.floor(k/12)).slice(2)}`,test:r=>r.y*12+r.m===k}));
+}
+function renderMetrics(){
+  const box=$("metBody");if(!box||$("invMetrics").hidden)return;
+  const M=state.met,all=metData();
+  const years=[...new Set([...MET_YEARS,...all.map(r=>r.y)])].sort((a,b)=>a-b).map(String);
+  fillMetSelect("metYear",years,M.year,"All years");
+  const ms=$("metMonth");if(ms){ms.replaceChildren(el("option",{value:"",text:"All 12 months"}));MONTHS_FULL.forEach((n,i)=>ms.append(el("option",{value:String(i),text:n})));ms.value=M.month;
+    $("metMonthWrap").hidden=M.period!=="month";}
+  const uniq=k=>[...new Set(all.map(r=>r[k]))].sort((a,b)=>a==="Not set"?1:b==="Not set"?-1:a.localeCompare(b));
+  fillMetSelect("metStore",[...new Set([...LOCATIONS,"Other location",...uniq("store")])].filter(v=>v!=="Not set").concat(uniq("store").includes("Not set")?["Not set"]:[]),M.store,"All stores",v=>v==="Not set"?v:v.replace(/^Lester Glenn /,""));
+  fillMetSelect("metDept",[...DEPTS,...uniq("dept").filter(d=>!DEPTS.includes(d))],M.dept,"All departments");
+  fillMetSelect("metCat",uniq("cat"),M.cat,"All item types");
+  $("metPeriod").value=M.period;$("metGroup").value=M.group;$("metMeasure").value=M.measure;
+  let rows=all.filter(r=>(!M.store||r.store===M.store)&&(!M.dept||r.dept===M.dept)&&(!M.cat||r.cat===M.cat));
+  if(M.period==="month"&&M.month!=="")rows=rows.filter(r=>r.m===Number(M.month));
+  if(M.year&&M.period==="month")rows=rows.filter(r=>r.y===Number(M.year));
+  if(M.year&&M.period==="year")rows=rows.filter(r=>r.y===Number(M.year)||r.y===Number(M.year)-1);
+  // summary
+  const sum=(l,k)=>l.reduce((n,r)=>n+r[k],0),top=k=>{const m=new Map();rows.forEach(r=>m.set(r[k],(m.get(r[k])||0)+r[M.measure]));const b=[...m].sort((a,b)=>b[1]-a[1])[0];return b?metLabel(k,b[0]):"—"};
+  const cards=$("metCards");cards.replaceChildren();
+  [[money(sum(rows,"value")),"Total value signed out"],[String(sum(rows,"qty")),"Items signed out"],[top("store"),"Top store"],[top("dept"),"Top department"]]
+    .forEach(([v,l])=>cards.append(el("div",{class:"pstat"},el("strong",{text:v}),el("span",{text:l}))));
+  box.replaceChildren();renderMetItems(rows);
+  if(!rows.length){box.append(el("div",{class:"met-empty",text:all.length?"No sign-outs match these choices.":"No sign-outs yet. Metrics fill in as items are signed out with Sign Out Inventory."}));return}
+  const periods=metPeriods(rows),g=M.group,meas=M.measure;
+  const groups=[...new Set(rows.map(r=>r[g]))].map(v=>({v,total:sum(rows.filter(r=>r[g]===v),meas)})).sort((a,b)=>b.total-a.total);
+  const fmt=n=>meas==="value"?money(n):String(n);
+  if(M.view==="graph"){renderMetChart(box,rows,periods,groups,g,meas,fmt);return}
+  // pivot table
+  const tbl=el("table",{class:"met-table"}),hr=el("tr",null,el("th",{text:{store:"Store",dept:"Department",cat:"Item type",item:"Item"}[g]}));
+  periods.forEach(p=>hr.append(el("th",{class:"num",text:p.label})));hr.append(el("th",{class:"num",text:"Total"}));
+  tbl.append(el("thead",null,hr));const tb=el("tbody");
+  const cell=(l)=>{const v=sum(l,"value"),q=sum(l,"qty");return !q?el("td",{class:"num zero",text:"–"}):el("td",{class:"num"},document.createTextNode(meas==="value"?money(v):String(q)),el("small",{text:meas==="value"?`${q} item${q===1?"":"s"}`:money(v)}))};
+  for(const gr of groups){const tr=el("tr",null,el("td",{class:"emp-name",text:metLabel(g,gr.v),title:gr.v}));const gl=rows.filter(r=>r[g]===gr.v);
+    periods.forEach(p=>tr.append(cell(gl.filter(p.test))));tr.append(cell(gl));tb.append(tr)}
+  const tot=el("tr",{class:"tot"},el("td",{text:"Total"}));periods.forEach(p=>tot.append(cell(rows.filter(p.test))));tot.append(cell(rows));tb.append(tot);
+  tbl.append(tb);box.append(el("div",{class:"scroll"},tbl));
+}
+function renderMetChart(box,rows,periods,groups,g,meas,fmt){
+  const sum=(l,k)=>l.reduce((n,r)=>n+r[k],0),NS="http://www.w3.org/2000/svg",mk=(t,a)=>{const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e};
+  const shown=groups.slice(0,8),other=groups.length>8;
+  const series=shown.map((gr,i)=>({label:metLabel(g,gr.v),color:MET_COLORS[i%MET_COLORS.length],test:r=>r[g]===gr.v}));
+  if(other){const keep=new Set(shown.map(x=>x.v));series.push({label:"Everything else",color:"#94a3b8",test:r=>!keep.has(r[g])})}
+  const data=periods.map(p=>{const pl=rows.filter(p.test);return series.map(s=>sum(pl.filter(s.test),meas))});
+  const max=Math.max(1,...data.map(a=>a.reduce((x,y)=>x+y,0)));
+  const step=Math.pow(10,Math.floor(Math.log10(max))),nice=Math.ceil(max/step)*step;
+  const W=820,H=320,L=70,R=12,T=14,B=34,cw=(W-L-R)/periods.length,bw=Math.max(6,Math.min(46,cw*.62));
+  const svg=mk("svg",{viewBox:`0 0 ${W} ${H}`,role:"img","aria-label":`Stacked chart of ${meas==="value"?"dollar amounts":"items"} by ${g==="dept"?"department":g==="cat"?"item type":g} over time`});
+  for(let i=0;i<=4;i++){const v=nice*i/4,y=T+(H-T-B)*(1-i/4);svg.append(mk("line",{x1:L,x2:W-R,y1:y,y2:y,class:"gl"}));
+    const t=mk("text",{x:L-8,y:y+4,"text-anchor":"end",class:"ax"});t.textContent=fmt(Math.round(v*100)/100).replace(".00","");svg.append(t)}
+  periods.forEach((p,i)=>{let y=H-B;const x=L+cw*i+(cw-bw)/2;
+    data[i].forEach((v,j)=>{if(!v)return;const h=(H-T-B)*v/nice;y-=h;const r=mk("rect",{x,y,width:bw,height:Math.max(1,h),fill:series[j].color,rx:2});
+      const ti=mk("title",{});ti.textContent=`${p.label} · ${series[j].label}: ${fmt(v)}`;r.append(ti);svg.append(r)});
+    const t=mk("text",{x:L+cw*i+cw/2,y:H-B+16,"text-anchor":"middle",class:"ax"});t.textContent=p.label;svg.append(t)});
+  const leg=el("div",{class:"met-legend"});series.forEach(s=>leg.append(el("span",null,el("i",{style:`background:${s.color}`}),document.createTextNode(s.label))));
+  const what=meas==="value"?"$ amount":"Items";
+  box.append(el("div",{class:"met-chart"},el("h3",{text:`${what} by ${{store:"store",dept:"department",cat:"item type",item:"item"}[g]}, ${state.met.period==="year"?"year by year":"month by month"}`}),leg,svg));
+  // totals bar chart
+  const totBox=el("div",{class:"met-chart"},el("h3",{text:`Total ${what.toLowerCase()} by ${{store:"store",dept:"department",cat:"item type",item:"item"}[g]}`}));
+  const hb=el("div",{class:"met-hbar"}),top=groups.slice(0,15),mx=Math.max(1,...top.map(x=>x.total));
+  top.forEach((gr,i)=>{hb.append(el("span",{text:metLabel(g,gr.v),title:gr.v}),el("div",{class:"track"},el("div",{class:"fill",style:`width:${(gr.total/mx*100).toFixed(1)}%;background:${MET_COLORS[i%MET_COLORS.length]}`})),el("b",{text:fmt(gr.total)}))});
+  totBox.append(hb);box.append(totBox);
+}
+function renderMetItems(rows){
+  const box=$("metItems");if(!box)return;box.replaceChildren();
+  const m=new Map();rows.forEach(r=>{const k=r.item;const e=m.get(k)||{item:k,cat:r.cat,qty:0,value:0,stores:new Map(),depts:new Map()};
+    e.qty+=r.qty;e.value+=r.value;e.stores.set(r.store,(e.stores.get(r.store)||0)+r.qty);e.depts.set(r.dept,(e.depts.get(r.dept)||0)+r.qty);m.set(k,e)});
+  const list=[...m.values()].sort((a,b)=>b.value-a.value||b.qty-a.qty);
+  $("metItemsNote").textContent=list.length?`${list.length} item${list.length===1?"":"s"} for the choices above`:"";
+  if(!list.length){box.append(el("div",{class:"met-empty",text:"Nothing to show yet."}));return}
+  const topOf=mp=>[...mp].sort((a,b)=>b[1]-a[1]).map(([k,n])=>`${metLabel("store",k)} (${n})`).slice(0,3).join(", ");
+  const tbl=el("table"),tb=el("tbody");
+  tbl.append(el("thead",null,el("tr",null,el("th",{text:"Item"}),el("th",{text:"Type"}),el("th",{class:"num",text:"Qty"}),el("th",{class:"num",text:"$ amount"}),el("th",{text:"Went to (stores)"}),el("th",{text:"Departments"}))));
+  list.forEach(e=>tb.append(el("tr",null,el("td",{class:"emp-name",text:e.item}),el("td",{text:e.cat}),el("td",{class:"num",text:String(e.qty)}),el("td",{class:"num",text:money(e.value)}),
+    el("td",{class:"note",text:topOf(e.stores)}),el("td",{class:"note",text:[...e.depts].sort((a,b)=>b[1]-a[1]).map(([k,n])=>`${k} (${n})`).slice(0,3).join(", ")}))));
+  tbl.append(tb);box.append(tbl);
+}
+function showMetrics(on){
+  $("invMetrics").hidden=!on;if($("invHistory"))$("invHistory").hidden=true;if($("invOrders"))$("invOrders").hidden=true;document.querySelectorAll(".inv-main").forEach(e=>e.hidden=on);
+  if(on){renderMetrics();$("metBack").focus()}else{renderInventory();applyWriteState();$("metOpen").focus()}
+}
+function wireMetrics(){
+  const onEl=(id,ev,fn)=>{const e=$(id);if(e)e.addEventListener(ev,fn)};
+  onEl("metOpen","click",()=>showMetrics(true));onEl("metBack","click",()=>showMetrics(false));
+  [["metYear","year"],["metMonth","month"],["metPeriod","period"],["metStore","store"],["metDept","dept"],["metCat","cat"],["metGroup","group"],["metMeasure","measure"]]
+    .forEach(([id,k])=>onEl(id,"change",()=>{state.met[k]=$(id).value;renderMetrics()}));
+  document.querySelectorAll('input[name="metView"]').forEach(r=>r.addEventListener("change",()=>{state.met.view=r.value;renderMetrics()}));
+  onEl("metCsv","click",async()=>{
+    const M=state.met,q=v=>`"${String(v??"").replace(/"/g,'""')}"`;
+    let rows=metData().filter(r=>(!M.store||r.store===M.store)&&(!M.dept||r.dept===M.dept)&&(!M.cat||r.cat===M.cat)&&(M.period!=="month"||M.month===""||r.m===Number(M.month))&&(!M.year||(M.period==="year"?(r.y===Number(M.year)||r.y===Number(M.year)-1):r.y===Number(M.year))));
+    const lines=[["Year","Month","Store","Department","Item type","Item","Quantity","$ amount"].map(q).join(",")];
+    rows.sort((a,b)=>a.y-b.y||a.m-b.m).forEach(r=>lines.push([r.y,MONTHS[r.m],r.store,r.dept,r.cat,r.item,r.qty,r.value.toFixed(2)].map(q).join(",")));
+    await saveCsv(`it-inventory-metrics-${todayIso()}.csv`,lines.join("\n"));
+  });
+}
+wireMetrics();
+/* ---------- inventory on order ---------- */
+const ORDER_OPEN=s=>s==="Ordered"||s==="Shipped";
+const orderLate=o=>ORDER_OPEN(o.status)&&o.eta&&o.eta<todayIso();
+const ORD_FILTERS={open:{label:"On order",test:o=>ORDER_OPEN(o.status)},late:{label:"Overdue",test:orderLate},received:{label:"Received",test:o=>o.status==="Received"},all:{label:"All orders",test:()=>true}};
+function orderItem(o){return o.itemId?(state.inventory||[]).find(x=>x.id===o.itemId)||null:null}
+function orderName(o){const it=orderItem(o);return it?it.name:(o.itemName||"Item")}
+function onOrderQty(itemId){return (state.orders||[]).filter(o=>o.itemId===itemId&&ORDER_OPEN(o.status)).reduce((n,o)=>n+(Number(o.qty)||0),0)}
+function ordFiltered(){
+  const q=($("ordSearch").value||"").trim().toLowerCase(),f=ORD_FILTERS[state.ordFilter||"open"];
+  return (state.orders||[]).filter(o=>f.test(o)&&(!q||[orderName(o),o.vendor,o.orderNumber,o.notes].some(v=>String(v||"").toLowerCase().includes(q))))
+    .sort((a,b)=>(orderLate(b)-orderLate(a))||(ORDER_OPEN(b.status)-ORDER_OPEN(a.status))||String(a.eta||"9999").localeCompare(String(b.eta||"9999"))||String(b.orderDate).localeCompare(String(a.orderDate)));
+}
+function renderOrders(){
+  const t=$("ordOpen");
+  if(t){let bd=t.querySelector(".tab-badge");if(!bd){bd=el("span",{class:"tab-badge",style:"background:var(--brand)"});t.append(bd)}
+    const n=(state.orders||[]).filter(o=>ORDER_OPEN(o.status)).length;bd.textContent=n?String(n):"";bd.title=n?`${n} open order${n===1?"":"s"}`:""}
+  const box=$("ordList");if(!box)return;box.replaceChildren();
+  const all=state.orders||[],st=$("ordStats");st.replaceChildren();
+  for(const [key,f] of Object.entries(ORD_FILTERS)){
+    const list=all.filter(f.test),on=(state.ordFilter||"open")===key;
+    const sub=key==="open"?` · ${money(list.reduce((n,o)=>n+(Number(o.qty)||0)*(Number(o.cost)||0),0))}`:"";
+    st.append(el("button",{type:"button",class:"pstat pstat-"+(key==="all"?"allord":key)+(on?" on":""),"aria-pressed":String(on),
+      "aria-label":`${f.label}: ${list.length}. ${on?"Showing":"Show"} ${f.label.toLowerCase()}.`,
+      onclick:()=>{state.ordFilter=key;renderOrders();applyWriteState()}},el("strong",{text:String(list.length)}),el("span",{text:f.label+sub})));
+  }
+  const rows=ordFiltered();
+  if(!rows.length){box.append(el("div",{class:"empty"},el("div",{text:all.length?"No orders match.":"Nothing on order. Select Add Order, or check items under Low Inventory Items and select Mark as On Order."})));return}
+  const tbl=el("table"),tb=el("tbody"),t0=todayIso();
+  tbl.append(el("thead",null,el("tr",null,el("th",{text:"Item"}),el("th",{class:"num",text:"Qty"}),el("th",{text:"Vendor"}),el("th",{text:"Ordered"}),
+    el("th",{text:"Expected"}),el("th",{text:"Order #"}),el("th",{class:"num",text:"Total"}),el("th",{text:"Status"}),el("th",null))));
+  for(const o of rows){
+    const it=orderItem(o),late=orderLate(o);
+    tb.append(el("tr",null,
+      el("td",null,el("div",{class:"ord-item"},it?invThumb(it):el("span",{class:"inv-thumb none","aria-hidden":"true",text:"📦"}),
+        el("div",null,el("div",{class:"emp-name",text:orderName(o)}),it?el("div",{class:"note",text:`In stock now: ${it.qty}${hasMin(it)?" · minimum "+it.min:""}`}):el("div",{class:"note",text:"Not linked to an inventory item"}),
+          o.notes?el("div",{class:"note",text:o.notes}):null))),
+      el("td",{class:"num",text:String(o.qty)}),
+      el("td",{text:o.vendor||"—"}),
+      el("td",{style:"white-space:nowrap",text:o.orderDate?fmtDate(o.orderDate):"—"}),
+      el("td",{style:"white-space:nowrap",class:late?"over":null,text:o.eta?fmtDate(o.eta)+(late?" (late)":o.eta===t0&&ORDER_OPEN(o.status)?" (today)":""):"—"}),
+      el("td",{text:o.orderNumber||"—"}),
+      el("td",{class:"num",text:o.cost!=null&&o.cost!==""?money(Number(o.cost)*Number(o.qty)):"—"}),
+      el("td",null,el("span",{class:"ost "+(late?"late":o.status),text:late?"Overdue":o.status}),
+        o.status==="Received"&&o.receivedAt?el("div",{class:"note",text:`${fmtStamp(o.receivedAt)}${o.receivedBy?" · "+o.receivedBy:""}`}):null),
+      el("td",{class:"num",style:"white-space:nowrap"},
+        ORDER_OPEN(o.status)?el("button",{class:"btn small wbtn",type:"button",text:"✓ Mark received","aria-label":`Mark ${orderName(o)} received`,onclick:()=>markReceived(o)}):null,
+        el("button",{class:"btn ghost wbtn",type:"button",text:"Edit","aria-label":`Edit order for ${orderName(o)}`,onclick:()=>openOrder(o)}),
+        el("button",{class:"btn ghost danger wbtn",type:"button",text:"Delete","aria-label":`Delete order for ${orderName(o)}`,onclick:()=>confirmDeleteOrder(o)}))));
+  }
+  tbl.append(tb);box.append(tbl);
+}
+async function markReceived(o){
+  const it=orderItem(o);
+  const msg=it?`Mark ${o.qty} × ${it.name} received?\n\nInventory will go from ${it.qty} to ${Number(it.qty)+Number(o.qty)}.`:`Mark ${o.qty} × ${orderName(o)} received?\n\nThis item isn’t linked to inventory, so no count will change.`;
+  if(!confirm(msg))return;
+  if(await receiveOrder(o,it))toast(it?`Received. ${it.name} is now at ${Number(it.qty)+Number(o.qty)}.`:"Order marked received.");
+}
+async function confirmDeleteOrder(o){if(confirm(`Delete the order for ${orderName(o)}?`)){if(await deleteOrder(o.id))toast("Order deleted")}}
+function fillOrderItems(sel){
+  const s=$("oItem");s.replaceChildren();
+  [...(state.inventory||[])].sort((a,b)=>a.name.localeCompare(b.name)).forEach(x=>s.append(el("option",{value:x.id,text:`${x.name} (${x.qty} on hand)`})));
+  s.append(el("option",{value:"",text:"Other item (not in inventory)"}));
+  s.value=sel!=null?sel:((state.inventory||[]).length?s.options[0].value:"");
+  $("oNameField").hidden=!!s.value;
+}
+function openOrder(o,itemId){
+  state.ordCtx=o||null;
+  $("ordTitle").textContent=o?`Edit order: ${orderName(o)}`:"Add Order";
+  fillOrderItems(o?(o.itemId||""):(itemId||null));
+  const it=o?orderItem(o):(state.inventory||[]).find(x=>x.id===$("oItem").value);
+  $("oName").value=o?(o.itemName||""):"";$("oQty").value=o?o.qty:(it&&hasMin(it)?Math.max(1,Number(it.min)-Number(it.qty)):1);
+  $("oCost").value=o&&o.cost!=null&&o.cost!==""?Number(o.cost).toFixed(2):(!o&&it&&it.cost!=null&&it.cost!==""?Number(it.cost).toFixed(2):"");
+  $("oVendor").value=o?(o.vendor||""):"Amazon";$("oStatus").value=o?o.status:"Ordered";
+  $("oDate").value=o?(o.orderDate||todayIso()):todayIso();$("oEta").value=o?(o.eta||""):"";
+  $("oNum").value=o?(o.orderNumber||""):"";$("oNotes").value=o?(o.notes||""):"";
+  $("ordDel").hidden=!o;$("ordErr").textContent="";$("ordDlg").showModal();$("oQty").focus();
+}
+async function markChecksOnOrder(){
+  const items=restockItems();if(!items.length){toast("Check the items you’ve ordered first.");return}
+  const vendor="Amazon",d=todayIso();
+  if(!confirm(`Add ${items.length} order${items.length===1?"":"s"} to Inventory On Order?\n\n`+items.map(x=>`• ${x.name}: ${Math.max(1,Number(x.min)-Number(x.qty))}`).join("\n")))return;
+  let ok=true;
+  for(const x of items){ok=await saveOrder(null,{itemId:x.id,itemName:x.name,qty:Math.max(1,Number(x.min)-Number(x.qty)),cost:x.cost??null,vendor,status:"Ordered",orderDate:d,eta:"",orderNumber:"",notes:""})&&ok}
+  if(ok){state.lowSel=new Set();renderInventory();applyWriteState();toast(`${items.length} item${items.length===1?"":"s"} added to Inventory On Order.`)}
+}
+function wireOrders(){
+  const onEl=(id,ev,fn)=>{const e=$(id);if(e)e.addEventListener(ev,fn)};
+  onEl("ordAdd","click",()=>openOrder(null));
+  onEl("ordSearch","input",()=>{renderOrders();applyWriteState()});
+  onEl("markOrdered","click",markChecksOnOrder);
+  onEl("oItem","change",()=>{const v=$("oItem").value;$("oNameField").hidden=!!v;const it=(state.inventory||[]).find(x=>x.id===v);
+    if(!state.ordCtx){$("oQty").value=it&&hasMin(it)?Math.max(1,Number(it.min)-Number(it.qty)):1;$("oCost").value=it&&it.cost!=null&&it.cost!==""?Number(it.cost).toFixed(2):""}});
+  onEl("ordDel","click",async()=>{const o=state.ordCtx;if(o&&confirm(`Delete the order for ${orderName(o)}?`)){if(await deleteOrder(o.id)){$("ordDlg").close();toast("Order deleted")}}});
+  onEl("ordForm","submit",async ev=>{
+    if(ev.submitter&&ev.submitter.value==="cancel")return;
+    ev.preventDefault();
+    const itemId=$("oItem").value,itemName=itemId?(((state.inventory||[]).find(x=>x.id===itemId)||{}).name||""):$("oName").value.trim();
+    const qty=Math.round(Number($("oQty").value)),costRaw=$("oCost").value.trim(),orderDate=$("oDate").value,eta=$("oEta").value;
+    if(!itemName){$("ordErr").textContent="Choose an inventory item or enter an item name.";return}
+    if(!(qty>=1)){$("ordErr").textContent="Quantity ordered must be at least 1.";return}
+    if(!orderDate){$("ordErr").textContent="Enter the order date.";return}
+    if(eta&&eta<orderDate){$("ordErr").textContent="Expected delivery can’t be before the order date.";return}
+    const o=state.ordCtx,status=$("oStatus").value;
+    const data={itemId:itemId||null,itemName,qty,cost:costRaw===""?null:Math.round(Number(costRaw)*100)/100,vendor:$("oVendor").value.trim(),status,orderDate,eta,
+      orderNumber:$("oNum").value.trim(),notes:$("oNotes").value.trim()};
+    if(o&&ORDER_OPEN(o.status)&&status==="Received"){
+      // Treat switching to Received like the Mark received button, so inventory goes up.
+      if(!(await saveOrder(o.id,{...data,status:o.status})))return;
+      $("ordDlg").close();await markReceived({...o,...data,status:o.status});return;
+    }
+    if(await saveOrder(o?o.id:null,data)){$("ordDlg").close();toast(o?"Order updated":"Order added")}
+  });
+  onEl("ordCsv","click",async()=>{
+    const q=v=>`"${String(v??"").replace(/"/g,'""')}"`;
+    const lines=[["Item","Quantity","Cost each","Total","Vendor","Order date","Expected delivery","Order / tracking #","Status","Received","Notes"].map(q).join(",")];
+    for(const o of ordFiltered())lines.push([orderName(o),o.qty,o.cost??"",o.cost!=null&&o.cost!==""?(Number(o.cost)*Number(o.qty)).toFixed(2):"",o.vendor,o.orderDate,o.eta,o.orderNumber,orderLate(o)?"Overdue":o.status,o.receivedAt||"",o.notes].map(q).join(","));
+    await saveCsv(`it-inventory-on-order-${todayIso()}.csv`,lines.join("\n"));
+  });
+}
+wireOrders();
+async function saveOrder(id,data){return write(()=>id?api("orders/"+encodeURIComponent(id),"PUT",data):api("orders","POST",data))}
+async function deleteOrder(id){return write(()=>api("orders/"+encodeURIComponent(id),"DELETE"))}
+async function receiveOrder(o){return write(()=>api("orders/"+encodeURIComponent(o.id)+"/receive","POST",{}))}
+async function signOutInv(it,entry,pin){return write(()=>api("inventory/"+encodeURIComponent(it.id)+"/signout","POST",{...entry,pin}))}
+async function addStock(it,n,cost,entry,pin){return write(()=>api("inventory/"+encodeURIComponent(it.id)+"/receive","POST",{qty:n,cost,notes:entry.notes,by:entry.by,pin}))}
+async function logNewItem(){} // the server records new items in the history
+async function saveCsv(name,csv){const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
+function goToProject(id){
+  if(PAGE!=="projects"){location.href="/projects/#project-"+encodeURIComponent(id);return}
+  const p=(state.projects||[]).find(x=>x.id===id);if(!p){toast("That project no longer exists.");return}
+  state.projFilter="all";state.projMonth=firstOfMonth(parse(p.start));renderProjects();openProject(p);
+}
+function setNhFull(on){
+  const p=$("nhPanel"),bt=$("nhFull");if(!p)return;p.classList.toggle("nh-max",on);
+  bt.textContent=on?"⤡ Exit full screen":"⤢ Full screen";bt.setAttribute("aria-pressed",String(on));
+  try{if(on&&p.requestFullscreen&&!document.fullscreenElement)p.requestFullscreen().catch(()=>{});if(!on&&document.fullscreenElement)document.exitFullscreen().catch(()=>{})}catch(_){}
+}
+on("nhFull","click",()=>setNhFull(!$("nhPanel").classList.contains("nh-max")));
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&$("nhPanel")&&$("nhPanel").classList.contains("nh-max"))setNhFull(false)});
+document.addEventListener("fullscreenchange",()=>{if(!document.fullscreenElement&&$("nhPanel")&&$("nhPanel").classList.contains("nh-max"))setNhFull(false)});
+function locSelect(emp){
+  const s=el("select",{class:"loc-sel","aria-label":`${emp.name}'s starting location`,title:"Starting location"});
+  s.append(el("option",{value:"",text:"Starting location…"}));
+  LOCATIONS.forEach(l=>s.append(el("option",{value:l,text:l})));
+  s.value=emp.location||"";
+  s.addEventListener("change",async()=>{if(await saveEmployee({id:emp.id,name:emp.name,role:emp.role||"",schedule:schedOf(emp),location:s.value}))toast(s.value?`${firstName(emp.name)} now starts at ${s.value}`:"Starting location cleared")});
+  return s;
+}
+function renderSchedule(){
+  const box=$("schedGrid");box.replaceChildren();
+  const days=[...Array(7)].map((_,i)=>addDays(state.weekStart,i));
+  $("weekLabel").textContent=fmtDate(days[0])+" – "+fmtDate(days[6]);
+  if(!state.loaded)return;
+  if(!state.employees.length){box.append(el("div",{class:"empty"},el("div",{text:"No team members yet. Add someone and set their regular hours."}),el("button",{class:"btn primary",type:"button",text:"Add team member",onclick:()=>openEmp(null)})));return}
+  const t=todayIso(),tbl=el("table",{class:"sched"});
+  const hr=el("tr",null,el("th",{text:"Team member"}));
+  days.forEach(d=>{const dt=parse(d);hr.append(el("th",null,el("button",{class:"dayhead"+(d===t?" is-today":""),type:"button","aria-pressed":String(d===state.selDay),"aria-label":`Show who's in on ${longDate(d)}`,onclick:()=>goToDay(d)},
+    document.createTextNode(dt.toLocaleDateString(undefined,{weekday:"short"})),el("b",{text:String(dt.getDate())}))))});
+  hr.append(el("th",{class:"num",text:"Hours"}));tbl.append(el("thead",null,hr));
+  const tb=el("tbody"),counts=days.map(()=>0);let teamHrs=0;
+  for(const emp of sortedEmps()){
+    const tr=el("tr",null,el("td",null,
+      el("button",{class:"rowbtn",type:"button","aria-label":`Edit ${emp.name}`,onclick:()=>openEmp(emp.id)},el("div",{class:"emp-name",text:emp.name}),emp.role?el("div",{class:"emp-role",text:emp.role}):null),
+      el("div",null,el("button",{class:"btn small",type:"button",style:"margin-top:4px",text:"Edit weekly hours","aria-label":`Edit ${emp.name}'s weekly hours and days`,onclick:()=>openEmp(emp.id,true)})),
+      locSelect(emp)));
+    let hrs=0;
+    days.forEach((d,i)=>{
+      const st=dayStatus(emp,d);let cls,kids;
+      if(st.out&&(st.hours||isWeekday(parse(d)))){cls="slot pto "+tc(st.pto.type);kids=[el("span",{class:"t",text:"Out"})];if(st.pto.type!=="Time off")kids.push(el("span",{class:"s",text:st.pto.type}))}
+      else if(st.working){
+        cls="slot work"+(st.ov?" changed":"")+(st.remote?" remote":"");counts[i]++;hrs+=durH(st.hours)*(st.partial?0.5:1);
+        kids=[el("span",{class:"t",text:fmtHours(st.hours)})];
+        if(st.loc&&!st.remote)kids.push(el("span",{class:"loc"+(st.loc==="Remote"?" rm":""),title:st.loc+(st.locChanged?" (this day only)":""),text:locShort(st.loc)+(st.locChanged?" *":"")}));
+        if(st.remote)kids.push(el("span",{class:"s",text:st.remote.calledOut?"Called out, remote":"Remote"}));
+        if(st.partial)kids.push(el("span",{class:"s",text:"Half day PTO"}));
+        if(st.ov)kids.push(el("span",{class:"s",text:st.ov.note||"Changed hours"}));
+      }else{cls="slot off";kids=[el("span",{class:"t",text:"Off"})];if(st.ov&&st.ov.note)kids.push(el("span",{class:"s",text:st.ov.note}))}
+      const label=`${emp.name}, ${longDate(d)}: ${kids.map(k=>k.textContent).join(", ")}. Change hours.`;
+      tr.append(el("td",{class:"cell"},el("button",{class:cls,type:"button","aria-label":label,onclick:()=>openShift(emp.id,d)},...kids)));
+    });
+    teamHrs+=hrs;tr.append(el("td",{class:"num",text:fmtNum(hrs)}));tb.append(tr);
+  }
+  const cov=el("tr",{class:"cov"},el("td",{style:"text-align:left",text:"Working"}));
+  counts.forEach((c,i)=>cov.append(el("td",{class:isWeekday(parse(days[i]))&&!c?"zero":null,text:String(c)})));
+  cov.append(el("td",{class:"num",text:fmtNum(teamHrs)}));tb.append(cov);tbl.append(tb);box.append(tbl);
+}
+
+function renderTimeline(){
+  const box=$("timeline");box.replaceChildren();
+  const d=state.selDay,t=todayIso();
+  $("dayTitle").textContent=d===t?"Who's in today":`Who's in on ${longDate(d)}`;
+  if(!state.loaded)return;
+  if(!state.employees.length){box.append(el("p",{class:"tl-sum",text:"Add team members to see the day's coverage."}));return}
+  const rows=sortedEmps().map(emp=>({emp,st:dayStatus(emp,d)})),work=rows.filter(r=>r.st.working);
+  let lo=1440,hi=0;work.forEach(r=>{const [a,b]=span(r.st.hours);lo=Math.min(lo,a);hi=Math.max(hi,Math.min(b,1440))});
+  if(!work.length){lo=420;hi=1140}
+  lo=Math.max(0,Math.floor(lo/60)*60-60);hi=Math.min(1440,Math.ceil(hi/60)*60+60);
+  if(hi-lo<600){hi=Math.min(1440,lo+600);lo=Math.max(0,hi-600)}
+  const range=hi-lo,hrsN=range/60,pct=m=>((m-lo)/range*100);
+  if(work.length){const a=Math.min(...work.map(r=>span(r.st.hours)[0])),b=Math.max(...work.map(r=>span(r.st.hours)[1]));
+    box.append(el("p",{class:"tl-sum",text:`${work.length} of ${rows.length} working. Coverage from ${fmtMin(a)} to ${fmtMin(b)}.`}))}
+  else box.append(el("p",{class:"tl-sum",text:"No one is scheduled this day."}));
+  const scale=el("div",{class:"tl-scale","aria-hidden":"true"}),step=hrsN>12?2:1;
+  for(let h=lo/60;h<=hi/60;h+=step)scale.append(el("span",{style:`left:${pct(h*60)}%`,text:fmtMin(h*60).replace(":00","")}));
+  box.append(scale);
+  const now=new Date(),nowM=now.getHours()*60+now.getMinutes();
+  for(const {emp,st} of rows){
+    const track=el("div",{class:"tl-track",style:`--h:${hrsN}`});
+    if(st.working){const [a,b]=span(st.hours),l=pct(Math.max(a,lo)),w=pct(Math.min(b,hi))-l;
+      track.append(el("div",{class:"tl-bar"+(st.partial?" half":"")+(st.remote?" remote":""),style:`left:${l}%;width:${w}%`,title:fmtHours(st.hours),text:fmtHours(st.hours)+(st.loc?`, ${locShort(st.loc)}`:"")+(st.partial?" (half day PTO)":"")}))}
+    else if(st.out&&st.pto)track.append(el("span",{class:"tl-label",text:st.pto.type==="Time off"?"Out":`Out, ${st.pto.type}`}));
+    else track.append(el("span",{class:"tl-label",text:"Off"}));
+    if(d===t&&nowM>=lo&&nowM<=hi)track.append(el("div",{class:"tl-now",style:`left:${pct(nowM)}%`,title:"Now"}));
+    box.append(el("div",{class:"tl-row"},el("div",{class:"tl-name",text:emp.name}),track));
+  }
+}
+
+function filteredRemote(){const fe=$("rfEmp").value,y=String(new Date().getFullYear());
+  return state.remote.filter(x=>x.start&&(x.start.slice(0,4)===y||x.end.slice(0,4)===y)&&empById(x.employeeId)&&(!fe||x.employeeId===fe)).sort((a,b)=>b.start.localeCompare(a.start))}
+function renderRemote(){
+  const box=$("remoteLog");box.replaceChildren();if(!state.loaded)return;
+  const rows=filteredRemote(),fe=$("rfEmp").value,fo=fe?empById(fe):null;
+  $("rBtn").textContent=fo?`Log remote day for ${firstName(fo.name)}`:"Log remote day";
+  if(!rows.length){box.append(el("div",{class:"empty"},el("div",{text:fo?`${fo.name} has no remote days logged this year.`:"No remote days logged this year yet."})));return}
+  const tbl=el("table"),tb=el("tbody"),t=todayIso();
+  tbl.append(el("thead",null,el("tr",null,el("th",{text:"Team member"}),el("th",{text:"Type"}),el("th",{text:"Dates"}),el("th",{class:"num",text:"Workdays"}),el("th",{text:"Note"}),el("th",null))));
+  for(const x of rows){
+    const e=empById(x.employeeId),status=x.end<t?"":(x.start<=t?" (now)":" (upcoming)");
+    tb.append(el("tr",null,el("td",{class:"emp-name",text:e.name}),
+      el("td",null,el("span",{class:"pill "+(x.calledOut?"callout":"remote"),text:x.calledOut?"Called out, remote":"Remote"})),
+      el("td",{style:"white-space:nowrap",text:fmtRange(x.start,x.end)+status}),el("td",{class:"num",text:String(bizDays(x.start,x.end))}),
+      el("td",{class:"note",text:x.note||""}),
+      el("td",{class:"num",style:"white-space:nowrap"},
+        el("button",{class:"btn ghost",type:"button","aria-label":`Add more remote days for ${e.name}`,text:"Add more",onclick:()=>openRemote(x.employeeId)}),
+        el("button",{class:"btn ghost danger",type:"button","aria-label":`Delete ${e.name}'s remote entry`,text:"Delete",onclick:async()=>{if(confirm(`Delete ${e.name}'s remote day${x.start===x.end?"":"s"} on ${fmtRange(x.start,x.end)}?`)){if(await removeRemote(x.id))toast("Remote entry deleted")}}}))));
+  }
+  tbl.append(tb);box.append(tbl);
+}
+
+function renderBalances(){
+  const box=$("balances");box.replaceChildren();$("balNote").textContent=`Calendar year ${state.year}`;
+  if(!state.employees.length){box.append(el("div",{class:"empty"},el("div",{text:"No team members yet."})));return}
+  const tbl=el("table"),tb=el("tbody");
+  tbl.append(el("thead",null,el("tr",null,el("th",{text:"Team member"}),el("th",{class:"num",text:"Allowance"}),el("th",{class:"num",text:"Taken"}),el("th",{class:"num",text:"Scheduled"}),el("th",{class:"num",text:"Remaining"}),el("th",{text:"Used"}),el("th",null))));
+  for(const emp of sortedEmps().filter(e=>ptoVisible(e.id))){
+    const b=balanceFor(emp),pT=b.allow?Math.min(100,b.taken/b.allow*100):0,pS=b.allow?Math.min(100-pT,b.sched/b.allow*100):0;
+    const bar=el("div",{class:"bar",role:"img","aria-label":`${fmtNum(b.taken+b.sched)} of ${fmtNum(b.allow)} days used or scheduled`},el("i",{class:"taken",style:`width:${pT}%`}),el("i",{class:"sched",style:`left:${pT}%;width:${pS}%`}));
+    const rc=b.remaining<0?"num over":(b.allow&&b.remaining<=2?"num low":"num");
+    tb.append(el("tr",null,el("td",null,el("button",{class:"rowbtn",type:"button",onclick:()=>openEmp(emp.id),"aria-label":`Edit ${emp.name}`},el("div",{class:"emp-name",text:emp.name}),emp.role?el("div",{class:"emp-role",text:emp.role}):null)),
+      el("td",{class:"num",text:fmtNum(b.allow)}),el("td",{class:"num",text:fmtNum(b.taken)}),el("td",{class:"num",text:fmtNum(b.sched)}),el("td",{class:rc,text:fmtNum(b.remaining)}),el("td",null,bar),
+      el("td",{class:"num",style:"white-space:nowrap"},
+        el("button",{class:"btn ghost",type:"button",text:"Edit","aria-label":`Edit ${emp.name}`,onclick:()=>openEmp(emp.id)}),
+        el("button",{class:"btn ghost danger",type:"button",text:"Remove","aria-label":`Remove ${emp.name}`,onclick:()=>confirmRemove(emp)}))));
+  }
+  tbl.append(tb);box.append(tbl);
+}
+
+function renderCalendar(){
+  const cal=$("cal");cal.replaceChildren();const m=state.calMonth;
+  $("calLabel").textContent=m.toLocaleDateString(undefined,{month:"long",year:"numeric"});
+  for(const d of ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"])cal.append(el("div",{class:"dow",text:d}));
+  const lead=(m.getDay()+6)%7;for(let i=0;i<lead;i++)cal.append(el("div",{class:"day pad","aria-hidden":"true"}));
+  const days=new Date(m.getFullYear(),m.getMonth()+1,0).getDate(),t=todayIso();
+  for(let n=1;n<=days;n++){
+    const d=new Date(m.getFullYear(),m.getMonth(),n),di=iso(d),wk=isWeekday(d),out=wk?outOn(di):[];
+    const cell=el("div",{class:"day"+(wk?"":" wknd")+(di===t?" is-today":"")},
+      el("div",{class:"dnum"},di===t?el("b",{text:String(n)}):el("span",{text:String(n)}),out.length?el("span",{class:"cnt"+(out.length>=3?" hi":""),text:out.length+" out"}):null));
+    out.slice(0,3).forEach(x=>{const e=empById(x.employeeId);cell.append(el("div",{class:"chip "+tc(x.type),title:`${e.name}: ${x.type}`},el("span",{text:firstName(e.name)})))});
+    if(out.length>3)cell.append(el("div",{class:"emp-role",style:"font-size:.75rem",text:`+${out.length-3} more`}));
+    cal.append(cell);
+  }
+  const trail=(7-((lead+days)%7))%7;for(let i=0;i<trail;i++)cal.append(el("div",{class:"day pad","aria-hidden":"true"}));
+}
+
+function filteredLog(){const fe=$("fEmp").value,ft=$("fType").value;
+  return entriesForYear(state.year).filter(x=>empById(x.employeeId)&&ptoVisible(x.employeeId)&&(!fe||x.employeeId===fe)&&(!ft||x.type===ft)).sort((a,b)=>b.start.localeCompare(a.start))}
+function renderLog(){
+  const box=$("log");box.replaceChildren();
+  const rows=filteredLog(),fe=$("fEmp").value,fo=fe?empById(fe):null;
+  $("logForBtn").textContent=fo?`Log time off for ${firstName(fo.name)}`:"Log time off";
+  if(!rows.length){
+    const msg=!state.employees.length?"Add a team member first, then log their time off.":(fo?`${fo.name} has no matching time off logged for ${state.year}.`:`No time off logged for ${state.year} yet.`);
+    box.append(el("div",{class:"empty"},el("div",{text:msg})));return;
+  }
+  const tbl=el("table"),tb=el("tbody"),t=todayIso();
+  tbl.append(el("thead",null,el("tr",null,el("th",{text:"Team member"}),el("th",{text:"Type"}),el("th",{text:"Dates"}),el("th",{class:"num",text:"Days"}),el("th",{text:"Note"}),el("th",null))));
+  for(const x of rows){
+    const e=empById(x.employeeId),status=x.end<t?"":(x.start<=t?" (now)":" (upcoming)");
+    tb.append(el("tr",null,el("td",{class:"emp-name",text:e.name}),el("td",null,el("span",{class:"pill "+tc(x.type),text:x.type})),
+      el("td",{style:"white-space:nowrap",text:fmtRange(x.start,x.end)+status}),el("td",{class:"num",text:fmtNum(Number(x.days)||0)}),
+      el("td",{class:"note",text:x.note||""}),
+      el("td",{class:"num",style:"white-space:nowrap"},
+        el("button",{class:"btn ghost",type:"button","aria-label":`Add more time off for ${e.name}`,text:"Add more",onclick:()=>openLog(x.employeeId,x.type)}),
+        el("button",{class:"btn ghost danger",type:"button","aria-label":`Delete ${e.name}'s ${x.type} entry`,text:"Delete",onclick:async()=>{if(confirm(`Delete ${e.name}'s ${x.type.toLowerCase()} on ${fmtRange(x.start,x.end)}?`)){if(await removeEntry(x.id))toast("Entry deleted")}}}))));
+  }
+  tbl.append(tb);box.append(tbl);
+}
+
+function fillSelect(id,withAll){
+  const s=$(id);if(!s)return;const cur=s.value,list=sortedEmps();
+  s.replaceChildren();if(withAll)s.append(el("option",{value:"",text:"Everyone"}));
+  list.forEach(e=>s.append(el("option",{value:e.id,text:e.name})));
+  if(list.some(e=>e.id===cur))s.value=cur;
+}
+function renderEmpSelects(){fillSelect("fEmp",true);fillSelect("lEmp",false);fillSelect("rfEmp",true);fillSelect("rEmp",false)}
+function renderYears(){
+  const y0=new Date().getFullYear(),ys=new Set();for(let y=y0-1;y<=Math.max(2035,y0+1);y++)ys.add(y);state.entries.forEach(x=>x.start&&ys.add(Number(x.start.slice(0,4))));
+  const sel=$("yearSel");sel.replaceChildren();[...ys].sort().forEach(y=>sel.append(el("option",{value:y,text:y})));sel.value=state.year;
+}
+function applyWriteState(){const none=!state.employees.length;["logBtn","logForBtn","rBtn"].forEach(id=>{const b=$(id);if(b)b.disabled=none})}
+
+/* ---------- email notifications (time off page) ---------- */
+function renderNotify(){
+  const box=$("notifyInfo");if(!box||!state.notify)return;const n=state.notify;
+  box.textContent=n.configured?`When time off is logged, an email goes to ${n.to.join(", ")} from ${n.from}.`
+    :`Not set up yet. Add these settings to the Cloudflare project: ${n.missing.join(", ")}. See the setup guide.`;
+  $("testMailBtn").disabled=!n.configured;
+}
+on("testMailBtn","click",async()=>{
+  const b=$("testMailBtn");b.disabled=true;b.textContent="Sending…";
+  try{const r=await api("notify/test","POST",{});toast(`Test email sent to ${r.to.join(", ")}.`)}
+  catch(e){toast(e.message)}
+  b.disabled=false;b.textContent="Send test email";
+});
+
+/* ---------- sign out ---------- */
+async function signOut(){try{await api("auth/logout","POST",{})}catch(_){}location.href="/login/?signedout=1"}
+
+/* ---------- logins (time off page, managers) ---------- */
+state.users=[];state.loginCtx=null;
+function fmtWhen(ms){if(!ms)return"Never";const d=new Date(ms);return d.toLocaleDateString(undefined,{month:"short",day:"numeric"})+", "+d.toLocaleTimeString(undefined,{hour:"numeric",minute:"2-digit"})}
+function renderLogins(){
+  const box=$("logins");if(!box)return;box.replaceChildren();
+  if(!state.users.length){box.append(el("div",{class:"empty"},el("div",{text:"No one has been added yet."})));return}
+  const tbl=el("table"),tb=el("tbody");
+  tbl.append(el("thead",null,el("tr",null,el("th",{text:"Name"}),el("th",{text:"Microsoft account"}),el("th",{text:"Access"}),el("th",{text:"Last sign-in"}),el("th",null))));
+  for(const u of state.users){
+    const me=state.me&&u.email===state.me.email;
+    tb.append(el("tr",null,el("td",{class:"emp-name",text:u.name+(me?" (you)":"")}),el("td",{text:u.email}),
+      el("td",null,el("span",{class:"pill "+(u.role==="manager"?"t-Vacation":"t-Other"),text:u.role==="manager"?"Manager":"Staff"})),
+      el("td",{style:"white-space:nowrap",text:fmtWhen(u.lastLogin)}),
+      el("td",{class:"num",style:"white-space:nowrap"},
+        el("button",{class:"btn ghost",type:"button",text:"Edit",onclick:()=>openLogin(u)}),
+        me?null:el("button",{class:"btn ghost danger",type:"button",text:"Remove",onclick:async()=>{if(confirm(`Remove ${u.name}'s access? They'll be signed out and won't be able to sign in.`)){if(await write(()=>api("users/"+encodeURIComponent(u.email),"DELETE")))toast("Access removed")}}}))));
+  }
+  tbl.append(tb);box.append(tbl);
+}
+function openLogin(u){
+  state.loginCtx=u||null;const edit=!!u;
+  $("loginTitle").textContent=edit?`Edit ${u.name}'s access`:"Add a person";
+  $("uName").value=edit?u.name:"";$("uEmail").value=edit?u.email:"";$("uEmail").disabled=edit;
+  $("uRole").value=edit?u.role:"staff";$("loginErr").textContent="";$("loginDlg").showModal();$(edit?"uRole":"uName").focus();
+}
+on("addLoginBtn","click",()=>openLogin(null));
+on("loginForm","submit",async ev=>{
+  if(ev.submitter&&ev.submitter.value==="cancel")return;
+  ev.preventDefault();
+  const u=state.loginCtx,name=$("uName").value.trim(),email=$("uEmail").value.trim().toLowerCase(),role=$("uRole").value;
+  if(!name){$("loginErr").textContent="Enter the person's name.";return}
+  if(!u&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){$("loginErr").textContent="Enter their Microsoft work email, e.g. name@lesterglenn.com.";return}
+  const ok=u?await write(()=>api("users/"+encodeURIComponent(u.email),"PUT",{name,role})):await write(()=>api("users","POST",{name,email,role}));
+  if(ok){$("loginDlg").close();toast(u?"Access updated":`Added. ${firstName(name)} can now sign in with Microsoft.`)}
+});
+
+/* ---------- team member dialog ---------- */
+function buildHours(schedule){
+  const box=$("eHours");box.replaceChildren();
+  for(const k of DAY_KEYS){
+    const s=schedule[k],cb=el("input",{type:"checkbox",id:`h_${k}_on`});cb.checked=!!s;
+    const st=el("input",{type:"time",id:`h_${k}_s`,"aria-label":`${DAY_LABEL[k]} start`});st.value=s?s.start:"08:00";
+    const en=el("input",{type:"time",id:`h_${k}_e`,"aria-label":`${DAY_LABEL[k]} end`});en.value=s?s.end:"16:30";
+    st.disabled=en.disabled=!s;cb.addEventListener("change",()=>{st.disabled=en.disabled=!cb.checked});
+    box.append(el("div",{class:"hrow"},el("label",{class:"hday"},cb,el("span",{text:DAY_LABEL[k]})),st,el("span",{class:"to",text:"to"}),en));
+  }
+}
+function readHours(){
+  const out={};
+  for(const k of DAY_KEYS){
+    if(!$(`h_${k}_on`).checked){out[k]=null;continue}
+    const s=$(`h_${k}_s`).value,e=$(`h_${k}_e`).value;
+    if(!s||!e)return {error:`Enter a start and end time for ${DAY_LABEL[k]}, or uncheck it.`};
+    if(s===e)return {error:`${DAY_LABEL[k]} start and end times can't be the same.`};
+    out[k]={start:s,end:e};
+  }
+  return {schedule:out};
+}
+on("copyMon","click",()=>{const o=$("h_mon_on").checked,s=$("h_mon_s").value,e=$("h_mon_e").value;
+  for(const k of ["tue","wed","thu","fri"]){$(`h_${k}_on`).checked=o;$(`h_${k}_s`).value=s;$(`h_${k}_e`).value=e;$(`h_${k}_s`).disabled=$(`h_${k}_e`).disabled=!o}});
+function openEmp(id,focusHours){
+  state.editingEmp=id;const e=id?empById(id):null;
+  $("empTitle").textContent=e?`Edit ${e.name}`:"Add team member";
+  $("empSave").textContent=e?"Save changes":"Save team member";
+  $("eName").value=e?e.name:"";$("eRole").value=e?(e.role||""):"";$("eLoc").value=e?(e.location||""):"";$("eAllow").value=e?allowanceOf(e):15;
+  $("allowField").hidden=!state.isAdmin;
+  $("ePinField").hidden=!state.isAdmin;$("ePin").value="";$("ePinNote").textContent=e&&(e.pinHash||e.hasPin)?"A PIN is set. Enter 4 new digits to change it, or leave blank to keep it.":"No PIN yet. They’ll need one to add or sign out inventory.";
+  buildHours(e?schedOf(e):DEFAULT_SCHED);
+  $("empDel").hidden=!e||!state.isAdmin;$("empErr").textContent="";
+  $("empDlg").showModal();
+  if(focusHours){$("eHours").closest("fieldset").scrollIntoView({block:"center"});$("h_mon_on").focus()}else $("eName").focus();
+}
+on("empForm","submit",async ev=>{
+  if(ev.submitter&&ev.submitter.value==="cancel")return;
+  ev.preventDefault();
+  const name=$("eName").value.trim(),role=$("eRole").value.trim(),allowance=Number($("eAllow").value),h=readHours();
+  if(!name){$("empErr").textContent="Enter a name.";return}
+  if(state.isAdmin&&!(allowance>=0)){$("empErr").textContent="Allowance must be 0 or more days.";return}
+  if(h.error){$("empErr").textContent=h.error;return}
+    const pin=$("ePin")?$("ePin").value.trim():"";if(pin&&!/^\d{4}$/.test(pin)){$("empErr").textContent="The PIN must be exactly 4 digits.";$("ePin").focus();return}
+  const editing=state.editingEmp,body={name,role,schedule:h.schedule,location:$("eLoc").value};
+  if(editing)body.id=editing;if(pin)body.pin=pin;if(state.isAdmin)body.allowance=allowance;
+  if(await saveEmployee(body)){$("empDlg").close();toast(editing?"Changes saved":"Team member added")}
+});
+async function confirmRemove(e){
+  if(!e)return;
+  const n=state.entries.filter(x=>x.employeeId===e.id).length;
+  if(!confirm(`Remove ${e.name} from the team${n?` along with their ${n} time off ${n===1?"entry":"entries"}`:""}? Their schedule and remote days are removed too. This can’t be undone.`))return;
+  if(await deleteEmployee(e.id))toast(`${e.name} removed from the team`);
+}
+on("empDel","click",async()=>{
+  const e=empById(state.editingEmp);if(!e)return;
+  if(!confirm(`Remove ${e.name}? Their schedule changes, remote days, and time off entries are removed too. This can't be undone.`))return;
+  if(await deleteEmployee(e.id)){$("empDlg").close();toast("Team member removed")}
+});
+
+/* ---------- shift dialog (schedule page) ---------- */
+function shiftMode(){return document.querySelector('input[name="smode"]:checked').value}
+function shiftScope(){return document.querySelector('input[name="sscope"]:checked').value}
+function syncShiftMode(){
+  const every=shiftScope()==="every";
+  $("regLabel").hidden=every;
+  if(every&&shiftMode()==="regular")document.querySelector('input[name="smode"][value="custom"]').checked=true;
+  $("customLbl").textContent=every?"Works these hours":"Different hours";
+  $("sNote").closest(".field").hidden=every;$("sLocField").hidden=every;
+  const c=shiftMode()==="custom";$("sStart").disabled=$("sEnd").disabled=!c;$("shiftTimes").style.opacity=c?1:.5;
+}
+document.querySelectorAll('input[name="smode"],input[name="sscope"]').forEach(r=>r.addEventListener("change",syncShiftMode));
+function openShift(empId,date){
+  const emp=empById(empId);if(!emp)return;state.shiftCtx={empId,date};
+  $("shiftTitle").textContent=`${emp.name}, ${longDate(date)}`;
+  const reg=regularFor(emp,date),ov=state.shiftMap.get(empId+"|"+date);
+  $("shiftRegular").textContent=reg?`Regular hours: ${fmtHours(reg)}`:"Not normally scheduled this day.";
+  document.querySelector(`input[name="smode"][value="${ov?(ov.off?"off":"custom"):"regular"}"]`).checked=true;
+  document.querySelector('input[name="sscope"][value="day"]').checked=true;
+  $("scopeDay").textContent=`Just ${fmtDate(date)}`;
+  $("scopeEvery").textContent=`Every ${parse(date).toLocaleDateString(undefined,{weekday:"long"})} (changes regular hours)`;
+  const times=ov&&!ov.off?ov:(reg||{start:"08:00",end:"16:30"});
+  $("sStart").value=times.start;$("sEnd").value=times.end;$("sNote").value=ov?(ov.note||""):"";
+  const sl=$("sLoc"),dl=state.locMap.get(empId+"|"+date);sl.replaceChildren(el("option",{value:"",text:emp.location?`Usual: ${emp.location}`:"Usual (not set)"}));
+  LOCATIONS.forEach(l=>sl.append(el("option",{value:l,text:l})));sl.value=dl?dl.location:"";
+  const pto=state.away.find(x=>x.employeeId===empId&&x.start<=date&&x.end>=date);
+  $("shiftPto").textContent=pto?`${firstName(emp.name)} is out this day (${fmtRange(pto.start,pto.end)}).`:"";
+  $("shiftPto").hidden=!pto;$("shiftErr").textContent="";
+  syncShiftMode();$("shiftDlg").showModal();
+}
+on("shiftForm","submit",async ev=>{
+  if(ev.submitter&&ev.submitter.value==="cancel")return;
+  ev.preventDefault();
+  const {empId,date}=state.shiftCtx,mode=shiftMode(),note=$("sNote").value.trim(),s=$("sStart").value,e=$("sEnd").value;
+  if(mode==="custom"){
+    if(!s||!e){$("shiftErr").textContent="Enter a start and end time.";return}
+    if(s===e){$("shiftErr").textContent="Start and end times can't be the same.";return}
+  }
+  let ok;
+  if(shiftScope()==="every"){
+    const emp=empById(empId),key=JS_DAY[parse(date).getDay()],sched={...schedOf(emp)};
+    sched[key]=mode==="off"?null:{start:s,end:e};
+    ok=await saveEmployee({id:empId,name:emp.name,role:emp.role||"",schedule:sched});
+    if(ok&&state.shiftMap.has(empId+"|"+date))ok=await clearShift(empId,date);
+    if(ok){$("shiftDlg").close();toast(`${firstName(emp.name)}'s regular ${parse(date).toLocaleDateString(undefined,{weekday:"long"})} hours updated`)}
+    return;
+  }
+  if(mode==="regular")ok=state.shiftMap.has(empId+"|"+date)?await clearShift(empId,date):true;
+  else if(mode==="off")ok=await setShift(empId,date,{off:true,note});
+  else ok=await setShift(empId,date,{off:false,start:s,end:e,note});
+  const curLoc=(state.locMap.get(empId+"|"+date)||{}).location||"",newLoc=$("sLoc").value;
+  if(ok&&newLoc!==curLoc)ok=await setDayLoc(empId,date,newLoc);
+  if(ok){$("shiftDlg").close();toast("Saved")}
+});
+
+/* ---------- remote dialog (schedule page) ---------- */
+function openRemote(empId){
+  if(!state.employees.length)return;
+  if(empId&&empById(empId))$("rEmp").value=empId;
+  const t=todayIso();$("rStart").value=t;$("rEnd").value=t;$("rCalled").checked=false;$("rNote").value="";$("rmErr").textContent="";
+  updateRmTitle();$("rmDlg").showModal();(empId?$("rStart"):$("rEmp")).focus();
+}
+function updateRmTitle(){const e=empById($("rEmp").value);$("rmTitle").textContent=e?`Log remote day for ${e.name}`:"Log remote day"}
+on("rEmp","change",updateRmTitle);
+on("rStart","change",()=>{const s=$("rStart").value,e=$("rEnd").value;if(s&&(!e||e<s))$("rEnd").value=s});
+on("rBtn","click",()=>openRemote($("rfEmp").value||null));
+on("rfEmp","change",renderRemote);
+on("rmForm","submit",async ev=>{
+  if(ev.submitter&&ev.submitter.value==="cancel")return;
+  ev.preventDefault();
+  const employeeId=$("rEmp").value,start=$("rStart").value,end=$("rEnd").value,calledOut=$("rCalled").checked,note=$("rNote").value.trim();
+  if(!employeeId){$("rmErr").textContent="Choose a team member.";return}
+  if(!start||!end||end<start){$("rmErr").textContent="The last day must be on or after the first day.";return}
+  const again=ev.submitter&&ev.submitter.value==="again";
+  if(await addRemote({employeeId,start,end,calledOut,note})){
+    if(again){let n=addDays(end,1);while(!isWeekday(parse(n)))n=addDays(n,1);$("rStart").value=n;$("rEnd").value=n;$("rCalled").checked=false;$("rNote").value="";$("rStart").focus();toast("Remote day saved");return}
+    $("rmDlg").close();toast("Remote day logged");
+  }
+});
+
+/* ---------- time off dialog (time off page) ---------- */
+function openLog(empId,type){
+  if(!state.employees.length)return;
+  if(empId&&empById(empId))$("lEmp").value=empId;
+  const t=todayIso();$("lStart").value=t;$("lEnd").value=t;$("lDays").value=bizDays(t,t)||1;$("lNote").value="";$("lType").value=type||"Vacation";$("logErr").textContent="";
+  updateLogTitle();checkOverlap();$("logDlg").showModal();(empId?$("lType"):$("lEmp")).focus();
+}
+function updateLogTitle(){const e=empById($("lEmp").value);$("logTitle").textContent=e?`Log time off for ${e.name}`:"Log time off"}
+function remainingNote(id){const e=empById(id);return e?`${firstName(e.name)} has ${fmtNum(balanceFor(e).remaining)} days remaining in ${state.year}.`:""}
+function syncDays(){const s=$("lStart").value,e=$("lEnd").value;if(s&&(!e||e<s))$("lEnd").value=s;$("lDays").value=bizDays($("lStart").value,$("lEnd").value);checkOverlap()}
+function checkOverlap(){
+  const s=$("lStart").value,e=$("lEnd").value,me=$("lEmp").value,w=$("overlap");
+  if(!s||!e){w.hidden=true;return}
+  const others=state.entries.filter(x=>x.employeeId!==me&&x.start<=e&&x.end>=s&&empById(x.employeeId));
+  const mine=state.entries.filter(x=>x.employeeId===me&&x.start<=e&&x.end>=s),parts=[];
+  if(mine.length)parts.push("This person already has time off logged on some of these dates.");
+  if(others.length)parts.push("Also out during these dates: "+[...new Set(others.map(x=>empById(x.employeeId).name))].join(", ")+".");
+  w.textContent=parts.join(" ");w.hidden=!parts.length;
+}
+on("lStart","change",syncDays);on("lEnd","change",syncDays);
+on("lEmp","change",()=>{updateLogTitle();checkOverlap()});
+on("logForm","submit",async ev=>{
+  if(ev.submitter&&ev.submitter.value==="cancel")return;
+  ev.preventDefault();
+  const employeeId=$("lEmp").value,type=$("lType").value,start=$("lStart").value,end=$("lEnd").value,days=Number($("lDays").value),note=$("lNote").value.trim();
+  if(!employeeId){$("logErr").textContent="Choose a team member.";return}
+  if(!start||!end||end<start){$("logErr").textContent="The last day off must be on or after the first day.";return}
+  if(!(days>0)){$("logErr").textContent="Days charged must be more than 0. Weekends aren't counted.";return}
+  const again=ev.submitter&&ev.submitter.value==="again";
+  if(await addEntry({employeeId,type,start,end,days,note})){
+    if(again){let n=addDays(end,1);while(!isWeekday(parse(n)))n=addDays(n,1);
+      $("lStart").value=n;$("lEnd").value=n;$("lDays").value=1;$("lNote").value="";$("logErr").textContent="";checkOverlap();$("lStart").focus();
+      toast("Saved. "+remainingNote(employeeId));return}
+    $("logDlg").close();toast("Time off logged. "+remainingNote(employeeId)+(state.notify&&state.notify.configured?" An email is on its way to managers.":""));
+    const y=Number(start.slice(0,4));if(y!==state.year){state.year=y;renderYears();render()}
+  }
+});
+
+/* ---------- CSV export (time off page) ---------- */
+on("csvBtn","click",()=>{
+  const q=v=>`"${String(v??"").replace(/"/g,'""')}"`;
+  const lines=[["Team member","Role","Type","First day","Last day","Days","Note"].map(q).join(",")];
+  for(const x of filteredLog()){const e=empById(x.employeeId);lines.push([e.name,e.role||"",x.type,x.start,x.end,x.days,x.note||""].map(q).join(","))}
+  lines.push("");lines.push(["Team member","Allowance","Taken","Scheduled","Remaining"].map(q).join(","));
+  for(const e of sortedEmps().filter(x=>ptoVisible(x.id))){const b=balanceFor(e);lines.push([e.name,b.allow,b.taken,b.sched,b.remaining].map(q).join(","))}
+  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([lines.join("\n")],{type:"text/csv"}));
+  a.download=`it-pto-${state.year}.csv`;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+});
+
+/* ---------- wiring ---------- */
+on("addEmpBtn","click",()=>openEmp(null));
+on("addEmpBtn2","click",()=>openEmp(null));
+on("logBtn","click",()=>openLog($("fEmp").value||null));
+on("logForBtn","click",()=>openLog($("fEmp").value||null));
+on("yearSel","change",e=>{state.year=Number(e.target.value);render()});
+on("fEmp","change",render);on("fType","change",render);
+on("prevM","click",()=>{const m=state.calMonth;state.calMonth=new Date(m.getFullYear(),m.getMonth()-1,1);renderCalendar()});
+on("nextM","click",()=>{const m=state.calMonth;state.calMonth=new Date(m.getFullYear(),m.getMonth()+1,1);renderCalendar()});
+on("thisM","click",()=>{state.calMonth=firstOfMonth(new Date());renderCalendar()});
+function moveWeek(n){const ws=addDays(state.weekStart,n*7);goToDay(ws===mondayOf(todayIso())?todayIso():ws)}
+on("prevW","click",()=>moveWeek(-1));on("nextW","click",()=>moveWeek(1));
+on("thisW","click",()=>goToDay(todayIso()));
+
+// Refresh every 30 seconds so changes from teammates show up, and every minute for the "on shift now" banner.
+setInterval(()=>{if(!document.hidden&&!document.querySelector("dialog[open]"))load()},30000);
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)load()});
+if(PAGE==="schedule")setInterval(()=>{renderToday();if(state.selDay===todayIso())renderTimeline()},60000);
+
+render();load();
+// On phones, scroll the page tabs so the current one is in view.
+{const t=document.querySelector('.ptab[aria-current="page"]');if(t&&t.parentElement.scrollWidth>t.parentElement.clientWidth)t.parentElement.scrollLeft=Math.max(0,t.offsetLeft-t.parentElement.offsetLeft-24)}
+})();
